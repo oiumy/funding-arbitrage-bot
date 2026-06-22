@@ -1,0 +1,8 @@
+config.py
+PROJECT_PLAN.md
+logs/
+reports/
+data/
+tools/
+__pycache__/
+*.pyc
