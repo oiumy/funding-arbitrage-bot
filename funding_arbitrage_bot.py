@@ -182,8 +182,9 @@ class ArbitrageState:
     predicted_funding_rate: float = 0.0
     net_rate: float = 0.0
     opened_at: str | None = None
-    spot_source: str = "spot"  # "spot" or "alpha"
+    spot_source: str = "spot"  # "spot", "alpha", or "margin"
     next_funding_time_ms: float = 0  # 合约下次结算时间戳(毫秒), 用于动态平仓
+    direction: str = "forward"  # "forward" or "reverse"
 
 
 @dataclass
@@ -521,6 +522,112 @@ class FundingArbitrageBot:
             )
         return order
 
+    # ── 逐仓杠杆 API（反向套利用） ──
+
+    async def _binance_margin_order(self, symbol: str, side: str,
+                                    quantity: float) -> dict[str, Any]:
+        """币安逐仓杠杆市价单 POST /sapi/v1/margin/order."""
+        clean = self._clean_spot_symbol(symbol)
+        resp = await self._binance_request(
+            BINANCE_SPOT_API, "/sapi/v1/margin/order",
+            {
+                "symbol": clean, "side": side.upper(), "type": "MARKET",
+                "quantity": quantity, "isIsolated": "TRUE",
+            },
+            method="POST",
+        )
+        order = self._normalize_order_response(resp, symbol, side, quantity)
+        if order["status"] != "closed":
+            raise ExchangeError(
+                f"Margin {side}未完全成交: {symbol} filled={order['filled']}/{quantity}"
+            )
+        return order
+
+    async def _binance_margin_loan(self, asset: str, amount: float,
+                                    margin_symbol: str) -> dict[str, Any]:
+        """逐仓杠杆借币 POST /sapi/v1/margin/loan."""
+        clean = self._clean_spot_symbol(margin_symbol)
+        resp = await self._binance_request(
+            BINANCE_SPOT_API, "/sapi/v1/margin/loan",
+            {"asset": asset, "amount": amount, "isIsolated": "TRUE", "symbol": clean},
+            method="POST",
+        )
+        logger.info("借币成功: %s %s (pair=%s)", amount, asset, clean)
+        return resp
+
+    async def _binance_margin_repay(self, asset: str, amount: float,
+                                     margin_symbol: str) -> dict[str, Any]:
+        """逐仓杠杆还款 POST /sapi/v1/margin/repay."""
+        clean = self._clean_spot_symbol(margin_symbol)
+        resp = await self._binance_request(
+            BINANCE_SPOT_API, "/sapi/v1/margin/repay",
+            {"asset": asset, "amount": amount, "isIsolated": "TRUE", "symbol": clean},
+            method="POST",
+        )
+        logger.info("还款完成: %s %s (pair=%s)", amount, asset, clean)
+        return resp
+
+    async def _binance_isolated_margin_transfer(
+        self, asset: str, amount: float, margin_symbol: str, direction: str,
+    ) -> dict[str, Any]:
+        """spot ↔ 逐仓杠杆划转 POST /sapi/v1/margin/isolated/transfer.
+        direction: "spot_to_margin" or "margin_to_spot"."""
+        clean = self._clean_spot_symbol(margin_symbol)
+        if direction == "spot_to_margin":
+            trans_from, trans_to = "SPOT", "ISOLATED_MARGIN"
+        else:
+            trans_from, trans_to = "ISOLATED_MARGIN", "SPOT"
+        resp = await self._binance_request(
+            BINANCE_SPOT_API, "/sapi/v1/margin/isolated/transfer",
+            {"asset": asset, "symbol": clean, "transFrom": trans_from,
+             "transTo": trans_to, "amount": amount},
+            method="POST",
+        )
+        logger.info("划转 %.2f %s: %s → %s", amount, asset, trans_from, trans_to)
+        return resp
+
+    async def _binance_margin_max_borrowable(
+        self, asset: str, margin_symbol: str,
+    ) -> tuple[bool, float]:
+        """查询逐仓可借上限 GET /sapi/v1/margin/maxBorrowable."""
+        clean = self._clean_spot_symbol(margin_symbol)
+        try:
+            resp = await self._binance_request(
+                BINANCE_SPOT_API, "/sapi/v1/margin/maxBorrowable",
+                {"asset": asset, "isIsolated": "TRUE", "symbol": clean},
+            )
+            max_amount = float(resp.get("amount", 0))
+            return max_amount > 0, max_amount
+        except Exception as exc:
+            logger.warning("查询可借上限失败 %s: %s", asset, exc)
+            return False, 0.0
+
+    async def _get_isolated_margin_account(self, margin_symbol: str) -> dict[str, Any]:
+        """查询逐仓杠杆账户详情 GET /sapi/v1/margin/isolated/account."""
+        clean = self._clean_spot_symbol(margin_symbol)
+        try:
+            resp = await self._binance_request(
+                BINANCE_SPOT_API, "/sapi/v1/margin/isolated/account",
+                {"symbols": clean},
+            )
+            assets = resp.get("assets", [])
+            return assets[0] if assets else {}
+        except Exception as exc:
+            logger.warning("查询逐仓账户失败 %s: %s", clean, exc)
+            return {}
+
+    async def _disable_isolated_margin_pair(self, margin_symbol: str) -> None:
+        """停用逐仓杠杆交易对，释放额度 DELETE /sapi/v1/margin/isolated/account."""
+        clean = self._clean_spot_symbol(margin_symbol)
+        try:
+            await self._binance_request(
+                BINANCE_SPOT_API, "/sapi/v1/margin/isolated/account",
+                {"symbol": clean}, method="DELETE",
+            )
+            logger.info("已停用逐仓交易对: %s", clean)
+        except Exception as exc:
+            logger.warning("停用逐仓交易对失败 %s: %s", clean, exc)
+
     async def fetch_taker_fees(
         self,
     ) -> tuple[dict[str, float], dict[str, float]]:
@@ -699,6 +806,7 @@ class FundingArbitrageBot:
                     "chain": chain,
                     "alpha_fee_ratio": alpha_fee_ratio,
                     "next_funding_time_ms": next_ft,
+                    "direction": "forward",
                 }
             )
 
@@ -770,13 +878,14 @@ class FundingArbitrageBot:
                 continue
             spot_symbol, spot_source, spot_last, spot_quote_volume, chain, alpha_fee_ratio = resolved
 
+            # Alpha 代币不能做杠杆交易，反向套利只走主站现货
+            if spot_source == "alpha":
+                continue
+
             if not self._passes_liquidity_filter(spot_quote_volume, futures_quote_volume):
                 continue
 
-            if spot_source == "alpha":
-                spot_fee = alpha_fee_ratio
-            else:
-                spot_fee = spot_taker_fees.get(
+            spot_fee = spot_taker_fees.get(
                     spot_symbol,
                     spot_taker_fees.get("__default__", self._effective_spot_taker_fee(DEFAULT_SPOT_TAKER_FEE)),
                 )
@@ -1039,6 +1148,15 @@ class FundingArbitrageBot:
         if not self.state.is_open:
             return False
 
+        if self.state.direction == "reverse":
+            futures_ok = await self._has_futures_long_position()
+            if futures_ok:
+                return True
+            logger.warning("状态文件显示有反向持仓，但交易所未发现合约多仓，重置状态。")
+            self.state = ArbitrageState()
+            self._save_state()
+            return False
+
         spot_ok, futures_ok = await asyncio.gather(
             self._has_spot_balance(),
             self._has_futures_short_position(),
@@ -1206,6 +1324,23 @@ class FundingArbitrageBot:
             )
         return False
 
+    async def _has_futures_long_position(self) -> bool:
+        if not self.state.futures_symbol:
+            return False
+        positions = await self._safe_request(
+            "futures.fetch_positions",
+            lambda: self.futures.fetch_positions([self.state.futures_symbol]),
+            default=[],
+        )
+        for position in positions:
+            if position.get("symbol") != self.state.futures_symbol:
+                continue
+            contracts = self._position_contracts(position)
+            return contracts > 0 or (
+                position.get("side") == "long" and abs(contracts) > 0
+            )
+        return False
+
     @staticmethod
     def _position_contracts(position: dict[str, Any]) -> float:
         for key in ("contracts", "contractSize"):
@@ -1227,11 +1362,15 @@ class FundingArbitrageBot:
             return 0.0
 
     async def open_arbitrage_position(self, row: pd.Series) -> bool:
-        """并发执行现货买入和合约开空，并处理单腿暴露。
+        """并发执行现货买入和合约开空（正向）或借币卖出+合约开多（反向）。
 
-        现货来源: main 主站或 alpha 预上线市场。
+        现货来源: main 主站、alpha 预上线市场或 margin 逐仓杠杆。
         Alpha 开仓前会查询链上实时 Gas，超标则跳过。
         """
+        direction = str(row.get("direction", "forward"))
+        if direction == "reverse":
+            return await self._open_reverse_position(row)
+
         spot_symbol = str(row["spot_symbol"])
         futures_symbol = str(row["futures_symbol"])
         spot_source = str(row.get("spot_source", "spot"))
@@ -1342,6 +1481,138 @@ class FundingArbitrageBot:
         await self._emergency_close_exposed_leg(spot_result, futures_result)
         return False
 
+    async def _open_reverse_position(self, row: pd.Series) -> bool:
+        """反向套利开仓: 借币 → margin卖出 → 合约开多。任一环节失败则全部撤销。"""
+        spot_symbol = str(row["spot_symbol"])
+        futures_symbol = str(row["futures_symbol"])
+        base = str(row["base"])
+        margin_symbol = spot_symbol  # same pair, e.g. "BTC/USDT"
+
+        # Step 0: 资金分配
+        await self._rebalance_accounts()
+        position_usdt = await self._get_position_size()
+        if position_usdt <= 0:
+            logger.error("可用余额不足，放弃反向开仓。")
+            return False
+
+        # Step 1: 划转 USDT spot → isolated margin 做抵押
+        logger.info("划转 %.2f USDT 到逐仓杠杆 [%s]", position_usdt, base)
+        try:
+            await self._binance_isolated_margin_transfer(
+                "USDT", position_usdt, margin_symbol, "spot_to_margin",
+            )
+        except Exception as exc:
+            logger.error("Margin 划转抵押失败: %s", exc)
+            return False
+
+        # Step 2: 开仓窗口检查
+        next_ft_ms = float(row.get("next_funding_time_ms", 0))
+        if not self._within_entry_window(next_ft_ms):
+            remaining_min = (next_ft_ms - time.time() * 1000) / 60_000 if next_ft_ms > 0 else 0
+            logger.info("距结算还有 %.0f 分钟，超出窗口，不开仓。", remaining_min)
+            await self._binance_isolated_margin_transfer(
+                "USDT", position_usdt, margin_symbol, "margin_to_spot",
+            )
+            return False
+
+        # Step 3: 计算数量
+        price = self._select_reference_price(row)
+        if not price or price <= 0:
+            logger.error("参考价格无效，放弃开仓。")
+            await self._binance_isolated_margin_transfer(
+                "USDT", position_usdt, margin_symbol, "margin_to_spot",
+            )
+            return False
+
+        amount = self._calculate_precise_amount(
+            spot_symbol=spot_symbol, futures_symbol=futures_symbol,
+            reference_price=price, spot_source="margin", total_usdt=position_usdt,
+        )
+        if amount <= 0:
+            logger.error("精度处理后的下单数量无效。")
+            await self._binance_isolated_margin_transfer(
+                "USDT", position_usdt, margin_symbol, "margin_to_spot",
+            )
+            return False
+
+        # Step 4: 查可借上限
+        can_borrow, max_borrowable = await self._binance_margin_max_borrowable(base, margin_symbol)
+        if not can_borrow or max_borrowable < amount:
+            logger.error("无法借够 %s: need=%s max=%s", base, amount, max_borrowable)
+            await self._binance_isolated_margin_transfer(
+                "USDT", position_usdt, margin_symbol, "margin_to_spot",
+            )
+            return False
+
+        # Step 5: 借币
+        try:
+            await self._binance_margin_loan(base, amount, margin_symbol)
+        except Exception as exc:
+            logger.error("借币 %s 失败: %s", base, exc)
+            await self._binance_isolated_margin_transfer(
+                "USDT", position_usdt, margin_symbol, "margin_to_spot",
+            )
+            return False
+
+        # Step 6: 并发 — margin 卖出 + 合约开多
+        logger.info(
+            "触发反向开仓: borrow+sell %s [margin] + %s long | amount=%s | price=%s | rate=%.6f | net=%.6f",
+            base, futures_symbol, amount, price, row["predicted_funding_rate"], row["net_rate"],
+        )
+        margin_task = self._open_margin_spot_leg(spot_symbol, amount)
+        futures_task = self._open_futures_long_leg(futures_symbol, amount)
+        margin_result, futures_result = await asyncio.gather(margin_task, futures_task)
+
+        # Step 7: 处理结果
+        if margin_result.ok and futures_result.ok:
+            next_ft = await self._fetch_next_funding_time(futures_symbol)
+            next_ft_dt = datetime.fromtimestamp(next_ft / 1000, tz=self.tz)
+            logger.info("合约 %s 下次结算: %s (距今 %.0f 分钟)",
+                        futures_symbol, next_ft_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        (next_ft - time.time() * 1000) / 60000)
+
+            self.state = ArbitrageState(
+                is_open=True,
+                spot_symbol=spot_symbol,
+                futures_symbol=futures_symbol,
+                base=base,
+                amount=amount,
+                spot_order_id=str(margin_result.order.get("id")),
+                futures_order_id=str(futures_result.order.get("id")),
+                entry_price=price,
+                predicted_funding_rate=float(row["predicted_funding_rate"]),
+                net_rate=float(row["net_rate"]),
+                opened_at=datetime.now(tz=self.tz).isoformat(),
+                spot_source="margin",
+                next_funding_time_ms=next_ft,
+                direction="reverse",
+            )
+            self._save_state()
+            self._print_position_summary()
+            await asyncio.to_thread(
+                self._send_email,
+                f"bazfbot 反向开仓: {base}",
+                f"币种: {base} [margin]\n数量: {amount}\n负费率: {float(row['predicted_funding_rate'])*100:.3f}%\n"
+                f"净收益: {float(row['net_rate'])*100:.3f}%\n"
+                f"结算: {datetime.fromtimestamp(next_ft/1000, tz=self.tz).strftime('%H:%M')}",
+            )
+            return True
+
+        # Step 8: 应急撤销
+        logger.critical("反向开仓双腿未同时成交！margin=%s futures=%s", margin_result, futures_result)
+        await self._emergency_close_exposed_leg(
+            margin_result, futures_result,
+            direction="reverse", margin_symbol=margin_symbol, base=base,
+        )
+        # 尝试划回 USDT（如果 margin 账户还有余额）
+        try:
+            await self._binance_isolated_margin_transfer(
+                "USDT", position_usdt, margin_symbol, "margin_to_spot",
+            )
+        except Exception:
+            pass
+        return False
+
     @staticmethod
     def _select_reference_price(row: pd.Series) -> float:
         for key in ("spot_last", "futures_last"):
@@ -1412,6 +1683,8 @@ class FundingArbitrageBot:
     ) -> LegResult:
         if spot_source == "alpha":
             return await self._open_alpha_spot_leg(symbol, amount)
+        if spot_source == "margin":
+            return await self._open_margin_spot_leg(symbol, amount)
         try:
             order = await self._binance_spot_order(symbol, "buy", amount)
             return LegResult(True, "spot", symbol, "buy", amount, order=order)
@@ -1436,32 +1709,61 @@ class FundingArbitrageBot:
             logger.error("合约开空失败 %s: %s", symbol, exc)
             return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
 
+    async def _open_futures_long_leg(self, symbol: str, amount: float) -> LegResult:
+        try:
+            order = await self._binance_futures_order(symbol, "buy", amount)
+            return LegResult(True, "futures", symbol, "buy", amount, order=order)
+        except Exception as exc:
+            logger.error("合约开多失败 %s: %s", symbol, exc)
+            return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
+
     async def _emergency_close_exposed_leg(
         self,
         spot_result: LegResult,
         futures_result: LegResult,
+        direction: str = "forward",
+        margin_symbol: str | None = None,
+        base: str | None = None,
     ) -> None:
         """若只成交一条腿，立刻用市价单撤销风险敞口。"""
-        close_tasks = []
+        close_tasks: list = []
+        repay_task: Any | None = None
 
-        if spot_result.ok and not futures_result.ok:
-            logger.critical("现货已买入但合约开空失败，市价卖出现货。")
-            spot_source = "alpha" if spot_result.market_type == "alpha_spot" else "spot"
-            close_tasks.append(
-                self._close_spot_leg(spot_result.symbol, spot_result.amount, spot_source)
-            )
-
-        if futures_result.ok and not spot_result.ok:
-            logger.critical("合约已开空但现货买入失败，市价平空合约。")
-            close_tasks.append(
-                self._close_futures_short_leg(
-                    futures_result.symbol,
-                    futures_result.amount,
+        if direction == "reverse" and margin_symbol and base:
+            if spot_result.ok and not futures_result.ok:
+                logger.critical("Margin 已卖出但合约开多失败，买回并归还借款。")
+                close_tasks.append(
+                    self._close_margin_spot_leg(spot_result.symbol, spot_result.amount)
                 )
-            )
+            if futures_result.ok and not spot_result.ok:
+                logger.critical("合约已开多但 Margin 卖出失败，平多。")
+                close_tasks.append(
+                    self._close_futures_long_leg(futures_result.symbol, futures_result.amount)
+                )
+            # Always try to repay the borrowed coin
+            if not spot_result.ok:
+                repay_task = self._binance_margin_repay(base, spot_result.amount, margin_symbol)
+        else:
+            if spot_result.ok and not futures_result.ok:
+                logger.critical("现货已买入但合约开空失败，市价卖出现货。")
+                spot_source = "alpha" if spot_result.market_type == "alpha_spot" else "spot"
+                close_tasks.append(
+                    self._close_spot_leg(spot_result.symbol, spot_result.amount, spot_source)
+                )
+            if futures_result.ok and not spot_result.ok:
+                logger.critical("合约已开空但现货买入失败，市价平空合约。")
+                close_tasks.append(
+                    self._close_futures_short_leg(futures_result.symbol, futures_result.amount)
+                )
 
         if close_tasks:
             await asyncio.gather(*close_tasks)
+        if repay_task:
+            try:
+                await repay_task
+            except Exception as exc:
+                logger.error("应急还款失败: %s", exc)
+        if close_tasks or repay_task:
             await asyncio.to_thread(
                 self._send_email,
                 "bazfbot 应急平仓！",
@@ -1473,6 +1775,8 @@ class FundingArbitrageBot:
     ) -> LegResult:
         if spot_source == "alpha":
             return await self._close_alpha_spot_leg(symbol, amount)
+        if spot_source == "margin":
+            return await self._close_margin_spot_leg(symbol, amount)
         precise = float(self.spot.amount_to_precision(symbol, amount))
         try:
             order = await self._binance_spot_order(symbol, "sell", precise)
@@ -1491,6 +1795,27 @@ class FundingArbitrageBot:
             logger.error("Alpha 现货卖出失败 %s: %s", symbol, exc)
             return LegResult(False, "alpha_spot", symbol, "sell", precise, error=str(exc))
 
+    async def _open_margin_spot_leg(self, symbol: str, amount: float) -> LegResult:
+        """反向套利：卖出借来的币（margin 现货卖单）."""
+        logger.info("Margin 卖出: symbol=%s amount=%s", symbol, amount)
+        try:
+            order = await self._binance_margin_order(symbol, "sell", amount)
+            return LegResult(True, "margin", symbol, "sell", amount, order=order)
+        except Exception as exc:
+            logger.error("Margin 卖出失败 %s: %s", symbol, exc)
+            return LegResult(False, "margin", symbol, "sell", amount, error=str(exc))
+
+    async def _close_margin_spot_leg(self, symbol: str, amount: float) -> LegResult:
+        """反向套利平仓：买回币还借款（margin 现货买单）."""
+        precise = float(self.spot.amount_to_precision(symbol, amount))
+        logger.info("Margin 买回: symbol=%s amount=%s", symbol, precise)
+        try:
+            order = await self._binance_margin_order(symbol, "buy", precise)
+            return LegResult(True, "margin", symbol, "buy", precise, order=order)
+        except Exception as exc:
+            logger.error("Margin 买回失败 %s: %s", symbol, exc)
+            return LegResult(False, "margin", symbol, "buy", precise, error=str(exc))
+
     async def _close_futures_short_leg(self, symbol: str, amount: float) -> LegResult:
         precise = float(self.futures.amount_to_precision(symbol, amount))
         try:
@@ -1499,6 +1824,15 @@ class FundingArbitrageBot:
         except Exception as exc:
             logger.error("合约平空失败 %s: %s", symbol, exc)
             return LegResult(False, "futures", symbol, "buy", precise, error=str(exc))
+
+    async def _close_futures_long_leg(self, symbol: str, amount: float) -> LegResult:
+        precise = float(self.futures.amount_to_precision(symbol, amount))
+        try:
+            order = await self._binance_futures_order(symbol, "sell", precise, reduce_only=True)
+            return LegResult(True, "futures", symbol, "sell", precise, order=order)
+        except Exception as exc:
+            logger.error("合约平多失败 %s: %s", symbol, exc)
+            return LegResult(False, "futures", symbol, "sell", precise, error=str(exc))
 
     async def _fetch_next_funding_time(self, futures_symbol: str) -> float:
         """获取合约的 nextFundingTime (毫秒时间戳)。失败则按 8h 估算。"""
@@ -1536,9 +1870,12 @@ class FundingArbitrageBot:
         return (datetime.now(tz=self.tz) - opened) > timedelta(hours=1)
 
     async def close_arbitrage_position(self) -> bool:
-        """结算后双腿并发平仓：卖出现货 + 买入平空永续合约。"""
+        """结算后双腿并发平仓。正向: 卖出现货+买入平空。反向: margin买回+卖出平多+还款。"""
         if not self.state.is_open:
             return True
+
+        if self.state.direction == "reverse":
+            return await self._close_reverse_position()
 
         logger.info(
             "开始平仓套利头寸: spot=%s futures=%s amount=%s",
@@ -1573,6 +1910,65 @@ class FundingArbitrageBot:
             futures_result,
         )
         return False
+
+    async def _close_reverse_position(self) -> bool:
+        """平仓反向套利: margin买回 + 合约平多 + 还款 + 划回 USDT。"""
+        if not self.state.is_open or self.state.direction != "reverse":
+            return True
+
+        logger.info(
+            "开始平仓反向套利: margin=%s futures=%s long amount=%s",
+            self.state.spot_symbol, self.state.futures_symbol, self.state.amount,
+        )
+
+        # Step 1: 并发 — margin买回 + 合约平多
+        margin_task = self._close_margin_spot_leg(self.state.spot_symbol, self.state.amount)
+        futures_task = self._close_futures_long_leg(self.state.futures_symbol, self.state.amount)
+        margin_result, futures_result = await asyncio.gather(margin_task, futures_task)
+
+        if not margin_result.ok or not futures_result.ok:
+            logger.error("反向平仓异常: margin=%s futures=%s", margin_result, futures_result)
+            return False
+
+        # Step 2: 查询实际负债（含利息），精确还款
+        base = self.state.base
+        amount = self.state.amount
+        margin_symbol = self.state.spot_symbol
+        margin_acct = await self._get_isolated_margin_account(margin_symbol)
+        base_asset = margin_acct.get("baseAsset", {})
+        borrowed = float(base_asset.get("borrowed", 0)) if base_asset else 0.0
+        repay_amount = max(borrowed, amount)
+        logger.info("精确还款: %s %s (借入=%s 负债=%s)", repay_amount, base, amount, borrowed)
+        try:
+            await self._binance_margin_repay(base, repay_amount, margin_symbol)
+        except Exception as exc:
+            logger.error("还款失败需手动处理: %s", exc)
+            # 尝试用买入的全部余额还款
+            try:
+                net_asset = float(base_asset.get("netAsset", amount)) if base_asset else amount
+                await self._binance_margin_repay(base, net_asset, margin_symbol)
+            except Exception as exc2:
+                logger.error("二次还款也失败: %s", exc2)
+
+        # Step 3: 划回 USDT（逐仓杠杆 → spot）
+        try:
+            await self._binance_isolated_margin_transfer(
+                "USDT", self.state.amount * self.state.entry_price, margin_symbol,
+                "margin_to_spot",
+            )
+        except Exception:
+            pass  # 金额可能不准，不影响
+
+        # Step 4: 停用逐仓交易对，释放额度
+        await self._disable_isolated_margin_pair(margin_symbol)
+
+        logger.info("反向套利平仓完成: 合约平多+Margin买回+还款均已完成。")
+        self.state = ArbitrageState()
+        self._save_state()
+        await asyncio.to_thread(
+            self._send_email, "bazfbot 反向平仓", "双腿已平，借款已归还，仓位已清空。"
+        )
+        return True
 
     async def run_once(self, force_entry: bool = False) -> None:
         """执行一次持仓检查、全市场扫描和开仓/平仓判断。
@@ -1621,19 +2017,36 @@ class FundingArbitrageBot:
             logger.error("可用余额为 0，请充值。")
             return
 
-        df = await self.scan_best_opportunity(position_usdt)
-        if df.empty:
-            logger.info("本轮未扫描到满足流动性条件的机会。")
+        # 并行扫描正向 + 反向
+        df_forward, df_reverse = await asyncio.gather(
+            self.scan_best_opportunity(position_usdt),
+            self.scan_reverse_opportunities(position_usdt),
+        )
+        frames = []
+        if not df_forward.empty:
+            frames.append(df_forward)
+        if not df_reverse.empty:
+            frames.append(df_reverse)
+
+        if not frames:
+            logger.info("本轮未扫描到满足条件的机会（正向+反向）。")
             return
 
-        # 打印前 10 个机会
+        df = pd.concat(frames, ignore_index=True).sort_values(
+            "net_rate", ascending=False,
+        ).reset_index(drop=True)
+
+        # 打印前 10 个机会（正向+反向混排）
         top10 = df.head(10)
-        sep = "  " + "-" * 90
-        header = f"  {'#':<3} {'币种':<8} {'来源':<5} {'资金费率':>8} {'现货费':>8} {'合约费':>8} {'净收益':>8} {'结算倒计时':>10}"
+        sep = "  " + "-" * 106
+        header = (
+            f"  {'#':<3} {'方向':<4} {'币种':<8} {'来源':<5} {'资金费率':>8} "
+            f"{'现货费':>8} {'合约费':>8} {'借币费':>8} {'净收益':>8} {'结算倒计时':>10}"
+        )
         logger.info(
-            "\n" + "=" * 92 + "\n"
-            "  当前可套利机会 (Top 10) — 每腿名义: %.2f USDT\n" % position_usdt
-            + "=" * 92 + "\n"
+            "\n" + "=" * 106 + "\n"
+            "  当前可套利机会 (正向+反向 Top 10) — 每腿名义: %.2f USDT\n" % position_usdt
+            + "=" * 106 + "\n"
             + header + "\n" + sep
         )
         for rank, (_, row) in enumerate(top10.iterrows(), 1):
@@ -1643,46 +2056,46 @@ class FundingArbitrageBot:
                 countdown = f"{int(mins)}min后" if mins < 120 else f"{mins/60:.0f}h后"
             else:
                 countdown = "N/A"
+            direction_label = "反向" if str(row.get("direction")) == "reverse" else "正向"
+            borrow_fee = float(row.get("borrow_hourly_rate") or 0)
             logger.info(
-                "  %-3d %-8s %-5s %7.3f%% %7.3f%% %7.3f%% %7.3f%% %10s",
-                rank,
-                str(row["base"])[:8],
-                str(row["spot_source"])[:5],
+                "  %-3d %-4s %-8s %-5s %7.3f%% %7.3f%% %7.3f%% %7.3f%% %7.3f%% %10s",
+                rank, direction_label, str(row["base"])[:8], str(row["spot_source"])[:5],
                 float(row["predicted_funding_rate"]) * 100,
                 float(row["spot_taker_fee"]) * 100,
                 float(row["futures_taker_fee"]) * 100,
-                float(row["net_rate"]) * 100,
-                countdown,
+                borrow_fee * 100, float(row["net_rate"]) * 100, countdown,
             )
-        logger.info(sep + "\n" + "=" * 92)
+        logger.info(sep + "\n" + "=" * 106)
 
         # 按净收益降序遍历，选第一个在结算窗口内且超阈值的机会
         for _, candidate in df.iterrows():
             net = float(candidate["net_rate"])
-            if net <= MIN_NET_RATE:
-                logger.info("从 %s 起净收益均低于阈值 %.2f%%，停止寻找。",
-                            candidate["base"], MIN_NET_RATE * 100)
+            direction = str(candidate.get("direction", "forward"))
+            threshold = REVERSE_MIN_NET_RATE if direction == "reverse" else MIN_NET_RATE
+
+            if net <= threshold:
+                logger.info("从 %s [%s] 起净收益均低于阈值，停止寻找。",
+                            candidate["base"], direction)
                 return
             nft = float(candidate.get("next_funding_time_ms", 0))
             within = self._within_entry_window(nft)
             if not within and nft > 0:
                 mins = max(0, (nft - time.time() * 1000) / 60000)
-                logger.info("跳过 %s: 距结算 %.0f min > 窗口 %d min",
-                            candidate["base"], mins, ENTRY_WINDOW_MINUTES)
+                logger.info("跳过 %s [%s]: 距结算 %.0f min > 窗口 %d min",
+                            candidate["base"], direction, mins, ENTRY_WINDOW_MINUTES)
                 continue
             logger.info(
-                "选中: %s [%s] | 费率=%.4f%% | 净收益=%.4f%% | 距结算 %s",
-                candidate["base"],
-                candidate["spot_source"],
-                float(candidate["predicted_funding_rate"]) * 100,
-                net * 100,
+                "选中: %s [%s] [%s] | 费率=%.4f%% | 净收益=%.4f%% | 距结算 %s",
+                candidate["base"], candidate["spot_source"], direction,
+                float(candidate["predicted_funding_rate"]) * 100, net * 100,
                 (f"{int(max(0, (nft - time.time() * 1000) / 60000))}min"
                  if nft > 0 else "?"),
             )
-            await self.open_arbitrage_position(candidate)
-            return
+            if await self.open_arbitrage_position(candidate):
+                return
 
-        logger.info("所有机会均不在结算窗口内，本轮不开仓。")
+        logger.info("所有机会均不在结算窗口内或开仓失败，本轮不开仓。")
 
     async def _query_evm_gas_price(self, chain: str) -> float | None:
         """Query current gas price for an EVM chain via JSON-RPC. Returns gas price in USD per tx."""
@@ -1796,16 +2209,20 @@ class FundingArbitrageBot:
     def _print_position_summary(self) -> None:
         position_notional = self.state.amount * self.state.entry_price
         estimated_profit = position_notional * self.state.net_rate
+        if self.state.direction == "reverse":
+            side_label = "long"
+            source_label = "margin"
+        else:
+            side_label = "short"
+            source_label = self.state.spot_source
         logger.info(
-            "当前套利持仓: %s [%s] + %s short | amount=%s | entry=%s "
+            "当前套利持仓 [%s]: %s [%s] + %s %s | amount=%s | entry=%s "
             "| 预测单期净利润≈%.4f USDT | opened_at=%s",
-            self.state.spot_symbol,
-            self.state.spot_source,
-            self.state.futures_symbol,
-            self.state.amount,
-            self.state.entry_price,
-            estimated_profit,
-            self.state.opened_at,
+            self.state.direction,
+            self.state.spot_symbol, source_label,
+            self.state.futures_symbol, side_label,
+            self.state.amount, self.state.entry_price,
+            estimated_profit, self.state.opened_at,
         )
 
     async def run_forever(self) -> None:
