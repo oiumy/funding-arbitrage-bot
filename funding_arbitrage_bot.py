@@ -87,7 +87,11 @@ USE_ROUND_TRIP_FEE_FOR_ENTRY = True
 REVERSE_ENABLED = True           # 反向策略总开关：--scan 时是否同时扫描负费率机会
 REVERSE_MIN_NET_RATE = 0.0002    # 反向净收益阈值（扣除借币利息后）
 REVERSE_RATE_BUFFER = 0.0003     # 费率波动缓冲 0.03%，净收益需超出阈值至少此值才开仓
+PRE_BORROW_SIGMA = 2.0          # 预借触发: 费率偏离中位数多少个标准差
+PRE_BORROW_MIN_RATE = -0.0002   # 预借触发: 费率必须已经为负 (-0.02%)
+PRE_BORROW_TIMEOUT_MINUTES = 30 # 预借超时: 超过此时间未到开仓线则归还
 MIN_SWITCH_SPREAD = 0.0001     # 换仓最小利差 0.01%，差额不够不换，避免摩擦损耗
+BORROW_POOL_EMPTY_COOLDOWN = 600  # 借币池空后 10 分钟不再尝试该币
 MARGIN_LEVEL_MIN = 1.3       # 逐仓保证金率最低阈值，币价涨62%触发，距强平18%缓冲
 FUTURES_LIQ_DISTANCE_MIN = 0.30  # 合约空单距强平最小距离30%，币价涨60%+触发
 
@@ -148,6 +152,10 @@ MARGIN_STATE_FILE = Path("data/margin_state.json")
 BINANCE_SPOT_API = "https://api.binance.com"
 BINANCE_FUTURES_API = "https://fapi.binance.com"
 
+# Binance WebSocket 订阅（实时费率推送，不消耗 API 权重）。
+WS_FUTURES_URL = "wss://fstream.binance.com/ws/!markPrice@arr"
+WS_FUTURES_TESTNET_URL = "wss://testnet.binancefuture.com/ws/!markPrice@arr"
+
 # Binance Alpha (pre-listing spot) API.
 ALPHA_API_BASE = "https://www.binance.com"
 ALPHA_TOKEN_LIST_PATH = "/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
@@ -161,7 +169,6 @@ logging.basicConfig(
     level=logging.INFO,
     format=LOG_FORMAT,
     handlers=[
-        logging.StreamHandler(),
         logging.handlers.TimedRotatingFileHandler(
             LOG_DIR / "bot.log", encoding="utf-8",
             when="midnight", backupCount=7,
@@ -190,6 +197,10 @@ class ArbitrageState:
     next_funding_time_ms: float = 0  # 合约下次结算时间戳(毫秒)
     direction: str = "forward"  # "forward" or "reverse"
     locked: bool = True  # True=刚开仓锁定期, False=自由人模式(随时可换仓)
+    pre_borrow_base: str = ""  # 预借中的币种 (空=无预借)
+    pre_borrow_margin_symbol: str = ""  # 预借的逐仓交易对
+    pre_borrow_amount: float = 0.0  # 预借数量
+    pre_borrow_at: str = ""  # 预借时间 ISO
 
 
 @dataclass
@@ -217,6 +228,8 @@ class FundingArbitrageBot:
         self.alpha_spot = self._create_alpha_spot_exchange()
         self._alpha_tokens: dict[str, dict[str, Any]] = {}
         self._alpha_last_fetch: float = 0.0
+        self._scan_lock = asyncio.Lock()  # 防止预借和主扫描冲突
+        self._borrow_blacklist: dict[str, float] = {}  # base → 过期时间戳, 借币池空后暂避
 
     @staticmethod
     def _ccxt_config(options: dict | None = None) -> dict[str, Any]:
@@ -639,7 +652,9 @@ class FundingArbitrageBot:
             return max_amount > 0, max_amount
         except Exception as exc:
             if "-3045" in str(exc):
-                logger.warning("%s 借币池暂无库存，稍后重试。", asset)
+                # 加入黑名单，10 分钟内不再尝试该币
+                self._borrow_blacklist[asset] = time.time() + BORROW_POOL_EMPTY_COOLDOWN
+                logger.warning("%s 借币池暂无库存，加入黑名单 %d 分钟。", asset, BORROW_POOL_EMPTY_COOLDOWN // 60)
             else:
                 logger.warning("查询可借上限失败 %s: %s", asset, exc)
             return False, 0.0
@@ -731,6 +746,10 @@ class FundingArbitrageBot:
                     continue
                 if sym == keep:
                     logger.info("保留逐仓交易对: %s（开仓目标，不回收）", sym)
+                    continue
+                # 跳过零余额账户，避免反复"清空"空账户
+                q = acct.get("quoteAsset", {}) or {}
+                if float(q.get("netAsset", 0)) <= 0:
                     continue
                 logger.info("回收逐仓资金: %s → spot", sym)
                 await self._drain_margin_to_spot(sym)
@@ -901,9 +920,14 @@ class FundingArbitrageBot:
         return symbol.replace("USDT", "")
 
     async def _drain_margin_to_spot(self, margin_symbol: str) -> bool:
-        """清空逐仓交易对资产并划回 USDT：卖出 base、归还借款、划回 quote。不停用交易对。"""
+        """清空逐仓交易对资产并划回 USDT：卖出 base、归还借款、划回 quote。零余额静默跳过。"""
         try:
             acct = await self._get_isolated_margin_account(margin_symbol)
+            quote_net_check = float((acct.get("quoteAsset", {}) or {}).get("netAsset", 0))
+            base_net_check = float((acct.get("baseAsset", {}) or {}).get("netAsset", 0))
+            base_borrowed_check = float((acct.get("baseAsset", {}) or {}).get("borrowed", 0))
+            if quote_net_check <= 0 and base_net_check <= 0 and base_borrowed_check <= 0:
+                return True  # 空账户，无需操作
             base_asset = acct.get("baseAsset", {})
             base_net = float(base_asset.get("netAsset", 0)) if base_asset else 0.0
             base_borrowed = float(base_asset.get("borrowed", 0)) if base_asset else 0.0
@@ -1354,6 +1378,23 @@ class FundingArbitrageBot:
                 index[market["base"]] = market
         return index
 
+    async def _fetch_premium_index_all(self) -> list[dict[str, Any]]:
+        """查询全部 USDT 永续合约溢价指数 (含资金费率). 公开接口无需签名.
+        返回 [{"symbol": "BTCUSDT", "markPrice": "...", "lastFundingRate": "...", ...}, ...]"""
+        import requests as _requests
+        url = f"{BINANCE_FUTURES_API}/fapi/v1/premiumIndex"
+        def _do():
+            proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY} if HTTP_PROXY else None
+            resp = _requests.get(url, proxies=proxies, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        try:
+            data = await asyncio.to_thread(_do)
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error("premiumIndex 查询失败: %s", e)
+            return []
+
     @staticmethod
     def _is_valid_spot_usdt_market(
         symbol: str,
@@ -1460,6 +1501,340 @@ class FundingArbitrageBot:
         now_ms = time.time() * 1000
         remaining_ms = next_funding_time_ms - now_ms
         return 0 < remaining_ms <= ENTRY_WINDOW_MINUTES * 60_000
+
+    def _compute_funding_stats(self, df: pd.DataFrame) -> tuple[float, float]:
+        """计算全市场资金费率中位数和标准差，用于异动检测。"""
+        rates = pd.to_numeric(df["predicted_funding_rate"], errors="coerce").dropna()
+        if rates.empty:
+            return 0.0, 0.0
+        return float(rates.median()), float(rates.std())
+
+    def _detect_rate_anomaly(self, df: pd.DataFrame, median: float, std: float
+                             ) -> pd.Series | None:
+        """检测费率异动: 负向偏离中位数 > PRE_BORROW_SIGMA 个标准差 且 费率已为负。
+        返回最优异动币（最低费率），无则返回 None。
+        仅扫描反向可做的币（有 margin 交易对）。
+        """
+        if std <= 0 or median >= 0:
+            return None
+        threshold = median - PRE_BORROW_SIGMA * std
+        best: pd.Series | None = None
+        best_rate = 0.0
+        for _, row in df.iterrows():
+            rate = float(row["predicted_funding_rate"])
+            direction = str(row.get("direction", "forward"))
+            if direction != "reverse":
+                continue
+            if rate < PRE_BORROW_MIN_RATE and rate < threshold:
+                if best is None or rate < best_rate:
+                    best = row
+                    best_rate = rate
+        return best
+
+    async def _execute_pre_borrow(self, row: pd.Series) -> bool:
+        """预借: 划转 USDT 到逐仓 + 借币，但不卖出。等费率到位后秒开。"""
+        base = str(row["base"])
+        if self._borrow_blacklist.get(base, 0) > time.time():
+            logger.info("[预借] %s 在黑名单中，跳过。", base)
+            return False
+        margin_symbol = str(row["spot_symbol"])
+        t_start = time.perf_counter()
+        price = self._select_reference_price(row)
+        if not price or price <= 0:
+            logger.warning("[预借] %s: 参考价格无效", base)
+            return False
+
+        # 计算 50/50 分配（ccxt + 直连 REST + 逐仓杠杆 三查）
+        spot_bal, futures_bal, spot_rest, futures_rest = await asyncio.gather(
+            self._safe_request("spot.fetch_balance", lambda: self.spot.fetch_balance(), default={}),
+            self._safe_request("futures.fetch_balance", lambda: self.futures.fetch_balance(), default={}),
+            self._safe_binance_balance(BINANCE_SPOT_API, "/api/v3/account"),
+            self._safe_binance_balance(BINANCE_FUTURES_API, "/fapi/v2/balance"),
+        )
+        spot_usdt_ccxt = self._free_balance(spot_bal, "USDT")
+        futures_usdt_ccxt = self._free_balance(futures_bal, "USDT")
+        spot_usdt = max(spot_usdt_ccxt, spot_rest)
+        futures_usdt = max(futures_usdt_ccxt, futures_rest)
+
+        # 也查逐仓杠杆 USDT（上次失败的回收可能留在了逐仓）
+        margin_usdt = 0.0
+        try:
+            resp = await self._binance_request(
+                BINANCE_SPOT_API, "/sapi/v1/margin/isolated/account",
+            )
+            for acct in (resp.get("assets", []) if isinstance(resp, dict) else []):
+                q = acct.get("quoteAsset", {})
+                if q:
+                    margin_usdt += float(q.get("netAsset", 0))
+        except Exception:
+            pass
+        if margin_usdt > 0:
+            logger.info("[预借] 发现逐仓 %.2f USDT 残留，回收归集。", margin_usdt)
+            for acct in (resp.get("assets", []) if isinstance(resp, dict) else []):
+                sym = acct.get("symbol", "")
+                if sym:
+                    await self._drain_margin_to_spot(sym)
+            spot_usdt += margin_usdt
+            margin_usdt = 0.0
+
+        total = spot_usdt + futures_usdt + margin_usdt
+        half = total / 2
+        position_usdt = half * POSITION_SIZE_RATIO
+        if half < 5.0:
+            logger.warning("[预借] %s: 余额不足 spot=%.2f futures=%.2f margin=%.2f total=%.2f half=%.2f",
+                           base, spot_usdt, futures_usdt, margin_usdt, total, half)
+            return False
+
+        # 启用逐仓交易对 + 划转 USDT
+        if not await self._ensure_margin_pair_enabled(margin_symbol):
+            logger.warning("[预借] %s: 无法启用逐仓交易对", base)
+            return False
+
+        need = self._floor_usdt(min(half, spot_usdt))
+        if need >= 1.0:
+            logger.info("[预借 1/3] 划转 %.2f USDT: 现货 → 逐仓 [%s]", need, base)
+            try:
+                await self._binance_isolated_margin_transfer(
+                    "USDT", need, margin_symbol, "spot_to_margin",
+                )
+            except Exception as exc:
+                logger.error("[预借] %s: 划转失败 %s", base, exc)
+                return False
+        else:
+            logger.info("[预借 1/3] 逐仓已有足够 USDT，跳过划转。")
+
+        # 借币
+        amount = self._calculate_precise_amount(
+            spot_symbol=margin_symbol, futures_symbol=str(row["futures_symbol"]),
+            reference_price=price, spot_source="margin", total_usdt=position_usdt,
+        )
+        if amount <= 0:
+            logger.warning("[预借] %s: 数量计算失败", base)
+            return False
+
+        nominal = amount * price
+        can_borrow, max_borrowable = await self._binance_margin_max_borrowable(base, margin_symbol)
+        if not can_borrow or max_borrowable < amount:
+            logger.warning("[预借] %s: 借币池不足 need=%s max=%s 池剩余=%.0f%%",
+                         base, amount, max_borrowable,
+                         max_borrowable / amount * 100 if amount > 0 else 0)
+            return False
+
+        logger.info("[预借 2/3] 借币 %s x%s | 价格=%.6f 名义=%.2f USDT | 池剩余=%.0f%%",
+                    base, amount, price, nominal,
+                    (1 - amount / max_borrowable) * 100 if max_borrowable > 0 else 0)
+        try:
+            await self._binance_margin_loan(base, amount, margin_symbol)
+        except Exception as exc:
+            logger.error("[预借] %s: 借币失败 %s", base, exc)
+            return False
+
+        # 记录状态
+        self.state.pre_borrow_base = base
+        self.state.pre_borrow_margin_symbol = margin_symbol
+        self.state.pre_borrow_amount = amount
+        self.state.pre_borrow_at = datetime.now(tz=self.tz).isoformat()
+        self._save_state()
+        elapsed = (time.perf_counter() - t_start) * 1000
+        target = (REVERSE_MIN_NET_RATE + REVERSE_RATE_BUFFER) * 100
+        logger.info(
+            "[预借 3/3] 完成! %s x%s | 费率=%+.4f%% 目标=%.3f%% | "
+            "耗时 %.0fms | 等待费率到位秒开",
+            base, amount, float(row["predicted_funding_rate"]) * 100,
+            target, elapsed,
+        )
+        return True
+
+    async def _cancel_pre_borrow(self) -> None:
+        """归还预借的币 + 划回 USDT。"""
+        base = self.state.pre_borrow_base
+        margin_symbol = self.state.pre_borrow_margin_symbol
+        amount = self.state.pre_borrow_amount
+        elapsed = (datetime.now(tz=self.tz) - datetime.fromisoformat(
+            self.state.pre_borrow_at)).total_seconds() / 60 if self.state.pre_borrow_at else 0
+        logger.info("[预借] 取消 | %s x%s | 已等待 %.0f min | 归还 + 划回 USDT", base, amount, elapsed)
+        try:
+            await self._binance_margin_repay(base, amount, margin_symbol)
+        except Exception as exc:
+            logger.error("[预借] 归还失败 %s: %s", base, exc)
+        await self._drain_margin_to_spot(margin_symbol)
+        self.state.pre_borrow_base = ""
+        self.state.pre_borrow_margin_symbol = ""
+        self.state.pre_borrow_amount = 0.0
+        self.state.pre_borrow_at = ""
+        self._save_state()
+
+    async def _run_ws_monitor(self) -> None:
+        """REST 快速轮询费率: 每 10s 查 fapi/v1/premiumIndex。
+        fstream WS 被墙，用 REST 替代，延迟从 1s 变为 10s。"""
+        if not REVERSE_ENABLED:
+            return
+
+        while True:
+            try:
+                data = await self._fetch_premium_index_all()
+                if data:
+                    await self._handle_ws_mark_price(data)
+            except Exception as exc:
+                logger.error("费率轮询异常: %s，10s 后重试", exc)
+            await asyncio.sleep(10)
+
+    async def _handle_ws_mark_price(self, data: list[dict[str, Any]]) -> None:
+        """处理 REST premiumIndex 数据（替代 WS !markPrice@arr 解析）。
+        每条: {"symbol": "BTCUSDT", "markPrice": "...", "lastFundingRate": "...", ...}"""
+
+        if self._scan_lock.locked():
+            return
+
+        has_position = await self.has_open_arbitrage_position()
+        if has_position:
+            if self.state.pre_borrow_base:
+                await self._cancel_pre_borrow()
+            return
+
+        # 构建费率列表
+        futures_index = self._build_futures_market_index()
+        t0 = time.perf_counter()
+        rates_data: list[dict[str, Any]] = []
+        negative_count = 0
+        for entry in data:
+            symbol = str(entry.get("symbol", ""))
+            if not symbol.endswith("USDT"):
+                continue
+            base = symbol[:-4]
+            if base not in futures_index:
+                continue
+            try:
+                rate = float(entry.get("lastFundingRate", 0))
+                mark_price = float(entry.get("markPrice", 0))
+            except (TypeError, ValueError):
+                continue
+            rates_data.append({
+                "base": base,
+                "rate": rate,
+                "futures_symbol": symbol,
+                "mark_price": mark_price,
+            })
+            if rate < 0:
+                negative_count += 1
+
+        if not rates_data:
+            self._poll_count = getattr(self, '_poll_count', 0) + 1
+            if self._poll_count <= 3 or self._poll_count % 30 == 0:
+                logger.info("[轮询] 第 %d 次, 暂无可匹配数据", self._poll_count)
+            return
+        temp_df = pd.DataFrame(rates_data)
+        rates_series = pd.to_numeric(temp_df["rate"])
+        median = float(rates_series.median())
+        std = float(rates_series.std())
+        min_rate = float(rates_series.min())
+        t1 = time.perf_counter()
+
+        # ── 心跳: 每 6 轮 (~1 min) 输出一次 ──
+        self._poll_count = getattr(self, '_poll_count', 0) + 1
+        if self._poll_count <= 3 or self._poll_count % 6 == 0:
+            open_threshold = (REVERSE_MIN_NET_RATE + REVERSE_RATE_BUFFER) * 100
+            anomaly_threshold = median - PRE_BORROW_SIGMA * std
+            anomaly_list = temp_df[temp_df["rate"] < anomaly_threshold]
+            logger.info(
+                "[轮询] #%d | %d 币 | 中位数=%+.4f%% σ=%.4f%% 最低=%+.4f%% | "
+                "负费率 %d 个 | 2σ阈值=%+.4f%% 超出 %d 个 | 耗时 %.1fms",
+                self._poll_count, len(rates_data), median * 100, std * 100, min_rate * 100,
+                negative_count, anomaly_threshold * 100, len(anomaly_list),
+                (t1 - t0) * 1000,
+            )
+            if len(anomaly_list) > 0:
+                top_anomaly = anomaly_list.nsmallest(5, "rate")
+                anomaly_str = " | ".join(
+                    f"{r['base']}={float(r['rate'])*100:+.3f}%" for _, r in top_anomaly.iterrows()
+                )
+                logger.info("[轮询] 超2σ: %s", anomaly_str)
+            else:
+                top_neg = temp_df.nsmallest(3, "rate")
+                neg_str = " | ".join(
+                    f"{r['base']}={float(r['rate'])*100:+.3f}%" for _, r in top_neg.iterrows()
+                )
+                logger.info("[轮询] Top3 最低: %s", neg_str)
+
+        # ── 预借状态检查 ──
+        if self.state.pre_borrow_base:
+            pb_rows = temp_df[temp_df["base"] == self.state.pre_borrow_base]
+            if pb_rows.empty:
+                logger.info("[预借] %s 已不在市场 → 取消", self.state.pre_borrow_base)
+                await self._cancel_pre_borrow()
+                return
+            current_rate = float(pb_rows.iloc[0]["rate"]) * 100
+            elapsed = (datetime.now(tz=self.tz) - datetime.fromisoformat(
+                self.state.pre_borrow_at)).total_seconds() / 60
+            target = (REVERSE_MIN_NET_RATE + REVERSE_RATE_BUFFER) * 100
+            if elapsed > PRE_BORROW_TIMEOUT_MINUTES:
+                await self._cancel_pre_borrow()
+                return
+            if int(elapsed) % 5 == 0 and getattr(self, '_pb_last_log_min', -1) != int(elapsed):
+                self._pb_last_log_min = int(elapsed)
+                logger.info("[预借] %s 等待中 | 当前费率=%+.4f%% 目标=%.3f%% | 已等 %.0f/%.0f min",
+                           self.state.pre_borrow_base, current_rate, target,
+                           elapsed, PRE_BORROW_TIMEOUT_MINUTES)
+            return
+
+        # ── 异动检测 ──
+        # 冷却: 上次预借失败后 120s 内不重试(避免和主扫描打架)
+        if getattr(self, '_pre_borrow_cooldown_until', 0) > time.time():
+            return
+        if std <= 0:
+            return
+        anomaly_threshold = median - PRE_BORROW_SIGMA * std
+        best: dict[str, Any] | None = None
+        best_rate = 0.0
+        for _, row in temp_df.iterrows():
+            rate = float(row["rate"])
+            if rate < PRE_BORROW_MIN_RATE and rate < anomaly_threshold:
+                if best is None or rate < best_rate:
+                    best = row.to_dict()
+                    best_rate = rate
+
+        if best is None:
+            return
+
+        base = str(best["base"])
+
+        # 先设冷却再执行，防止并发竞态
+        self._pre_borrow_cooldown_until = time.time() + 120
+        logger.info(
+            "=" * 60 + "\n"
+            "  [异动!] %s 费率暴跌 | 当前=%+.4f%% | 中位数=%+.4f%% | σ=%.4f%%\n"
+            "  异动阈值=%+.4f%% (中位数-%.0fσ) | 负费率共 %d 个 | 触发预借\n"
+            + "=" * 60,
+            base, best_rate * 100, median * 100, std * 100,
+            anomaly_threshold * 100, PRE_BORROW_SIGMA, negative_count,
+        )
+
+        if self._scan_lock.locked():
+            logger.info("[异动] 全量扫描进行中，预借稍后处理。")
+            return
+
+        async with self._scan_lock:
+            if await self.has_open_arbitrage_position():
+                return
+            if self.state.pre_borrow_base:
+                return
+
+            futures_symbol = str(best["futures_symbol"])
+            mark_price = float(best.get("mark_price", 0))
+            minimal_row = pd.Series({
+                "base": base,
+                "spot_symbol": f"{base}/USDT",
+                "futures_symbol": futures_symbol,
+                "predicted_funding_rate": best_rate,
+                "spot_last": mark_price,
+                "futures_last": mark_price,
+                "direction": "reverse",
+            })
+            logger.info("[异动] 开始预借 %s | 费率=%+.4f%% | 标记价=%.6f",
+                       base, best_rate * 100, mark_price)
+            ok = await self._execute_pre_borrow(minimal_row)
+            if not ok:
+                logger.info("[异动] 预借失败，120s 冷却。")
 
     async def has_open_arbitrage_position(self) -> bool:
         """根据状态文件和交易所当前仓位确认是否仍有套利持仓。"""
@@ -1599,6 +1974,22 @@ class FundingArbitrageBot:
             )
             return False
         return True
+
+    async def _safe_binance_balance(self, base_url: str, path: str) -> float:
+        """直连 Binance REST 查 USDT 余额，ccxt 查不到时的 fallback。"""
+        try:
+            data = await self._binance_request(base_url, path)
+            if path == "/api/v3/account":
+                for b in data.get("balances", []):
+                    if b.get("asset") == "USDT":
+                        return float(b.get("free", 0))
+            else:
+                for b in (data if isinstance(data, list) else []):
+                    if b.get("asset") == "USDT":
+                        return float(b.get("balance", 0))
+        except Exception:
+            pass
+        return 0.0
 
     @staticmethod
     def _free_balance(balance: dict[str, Any], asset: str) -> float:
@@ -1812,6 +2203,11 @@ class FundingArbitrageBot:
         base = str(row["base"])
         margin_symbol = spot_symbol  # same pair, e.g. "BTC/USDT"
 
+        if self._borrow_blacklist.get(base, 0) > time.time():
+            remaining = int(self._borrow_blacklist[base] - time.time())
+            logger.info("%s 借币池黑名单中 (剩余 %ds)，跳过。", base, remaining)
+            return False
+
         # [1/5] 回收闲置资金（跳过目标交易对，避免划走又划回）+ 50/50 分配
         await self._reclaim_all_usdt(keep_symbol=margin_symbol)
         spot_bal, futures_bal, target_margin_acct = await asyncio.gather(
@@ -1931,19 +2327,27 @@ class FundingArbitrageBot:
             return False
 
         logger.info("[3/5] 价格=%.6f 数量=%s 名义=%.2f USDT", price, amount, amount * price)
-        can_borrow, max_borrowable = await self._binance_margin_max_borrowable(base, margin_symbol)
-        if not can_borrow or max_borrowable < amount:
-            logger.error("[3/5] 无法借够 %s: need=%s max=%s，划回 USDT 并放弃开仓。",
-                         base, amount, max_borrowable)
-            await self._drain_margin_to_spot(margin_symbol)
-            return False
 
-        try:
-            await self._binance_margin_loan(base, amount, margin_symbol)
-        except Exception as exc:
-            logger.error("[3/5] 借币 %s API 失败: %s，划回 USDT 并放弃开仓。", base, exc)
-            await self._drain_margin_to_spot(margin_symbol)
-            return False
+        # 检查是否已预借 (pre-borrow)
+        base_asset = margin_acct.get("baseAsset", {}) if margin_acct else {}
+        already_borrowed = float(base_asset.get("borrowed", 0)) if base_asset else 0.0
+        if already_borrowed >= amount:
+            logger.info("[3/5] 已预借 %s x%s (borrowed=%.4f)，跳过借币。", base, amount, already_borrowed)
+        else:
+            need_borrow = amount - already_borrowed if already_borrowed > 0 else amount
+            can_borrow, max_borrowable = await self._binance_margin_max_borrowable(base, margin_symbol)
+            if not can_borrow or max_borrowable < need_borrow:
+                logger.error("[3/5] 无法借够 %s: need=%s max=%s，划回 USDT 并放弃开仓。",
+                             base, need_borrow, max_borrowable)
+                await self._drain_margin_to_spot(margin_symbol)
+                return False
+
+            try:
+                await self._binance_margin_loan(base, need_borrow, margin_symbol)
+            except Exception as exc:
+                logger.error("[3/5] 借币 %s API 失败: %s，划回 USDT 并放弃开仓。", base, exc)
+                await self._drain_margin_to_spot(margin_symbol)
+                return False
 
         # [4/5] 并发下单 — margin 卖出 + 合约开多
         logger.info(
@@ -2497,6 +2901,7 @@ class FundingArbitrageBot:
             return
 
         # 扫描展示用估算仓位，不划转资金（开仓时才按需划转）
+        logger.info("┏━━ 主扫开始 ━━")
         spot_free, futures_free = await asyncio.gather(
             self._safe_request("spot.fetch_balance", lambda: self.spot.fetch_balance(), default={}),
             self._safe_request("futures.fetch_balance", lambda: self.futures.fetch_balance(), default={}),
@@ -2550,6 +2955,50 @@ class FundingArbitrageBot:
         df = pd.concat(frames, ignore_index=True).sort_values(
             "net_rate", ascending=False,
         ).reset_index(drop=True)
+
+        # ── 反向费率异动预借（主循环兜底检查） ──
+        if REVERSE_ENABLED and not has_position:
+            if self.state.pre_borrow_base:
+                pre_row = df[(df["base"] == self.state.pre_borrow_base)
+                             & (df.get("direction", "forward") == "reverse")]
+                if not pre_row.empty:
+                    r = pre_row.iloc[0]
+                    net = float(r["net_rate"])
+                    target = REVERSE_MIN_NET_RATE + REVERSE_RATE_BUFFER
+                    if net > target:
+                        elapsed = (datetime.now(tz=self.tz) - datetime.fromisoformat(
+                            self.state.pre_borrow_at)).total_seconds() / 60 if self.state.pre_borrow_at else 0
+                        logger.info(
+                            "[预借→秒开] %s | 净利=%+.4f%% 已到开仓线 %.3f%% | "
+                            "等待 %.0f min | 跳过借币直接开仓",
+                            self.state.pre_borrow_base, net * 100, target * 100, elapsed,
+                        )
+                        self.state.pre_borrow_base = ""
+                        self.state.pre_borrow_margin_symbol = ""
+                        self.state.pre_borrow_amount = 0.0
+                        self.state.pre_borrow_at = ""
+                        self._save_state()
+                        if await self._open_reverse_position(r):
+                            return
+                        logger.warning("[预借→秒开] 开仓失败，下轮重试。")
+                    else:
+                        elapsed = (datetime.now(tz=self.tz) - datetime.fromisoformat(
+                            self.state.pre_borrow_at)).total_seconds() / 60
+                        if elapsed > PRE_BORROW_TIMEOUT_MINUTES:
+                            await self._cancel_pre_borrow()
+                else:
+                    logger.info("[预借] %s 已不在候选列表 → 取消", self.state.pre_borrow_base)
+                    await self._cancel_pre_borrow()
+            elif total_usdt > 10:
+                # 无预借：检测费率异动
+                median, std = self._compute_funding_stats(df)
+                anomaly = self._detect_rate_anomaly(df, median, std)
+                if anomaly is not None:
+                    base = str(anomaly["base"])
+                    rate = float(anomaly["predicted_funding_rate"]) * 100
+                    logger.info("费率异动: %s → %.4f%% (中位数=%.4f%%, σ=%.4f%%)，触发预借！",
+                               base, rate, median * 100, std * 100)
+                    await self._execute_pre_borrow(anomaly)
 
         # 打印前 10 个机会（正向+反向混排）
         top10 = df.head(10)
@@ -2875,22 +3324,39 @@ class FundingArbitrageBot:
         )
 
     async def run_forever(self) -> None:
-        """打卡模式主循环: 有持仓按实际结算时间平仓, 无持仓定时扫描。"""
+        """打卡模式主循环: 有持仓按实际结算时间平仓, 无持仓定时扫描。
+        双循环: REST 快速轮询费率 (预借) + 60s 全量扫 (开平仓决策)。"""
         await self.initialize()
 
-        logger.info("启动完成，进入主循环。")
-        while True:
-            sleep_seconds = self._seconds_until_next_wakeup()
-            wakeup_at = datetime.now(tz=self.tz) + timedelta(seconds=sleep_seconds)
-            has_pos = await self.has_open_arbitrage_position()
-            logger.info(
-                "休眠 %.0f 分钟, 下次唤醒: %s (当前%s持仓)",
-                sleep_seconds / 60,
-                wakeup_at.strftime("%m-%d %H:%M:%S"),
-                "有" if has_pos else "无",
-            )
-            await asyncio.sleep(sleep_seconds)
-            await self.run_once()
+        logger.info("启动完成，进入双循环: REST 费率轮询 + 60s 全量决策。")
+
+        async def poller_loop():
+            await self._run_ws_monitor()
+
+        async def main_loop():
+            while True:
+                sleep_seconds = self._seconds_until_next_wakeup()
+                wakeup_at = datetime.now(tz=self.tz) + timedelta(seconds=sleep_seconds)
+                has_pos = await self.has_open_arbitrage_position()
+                logger.info(
+                    "┗━━ 主扫结束 | 休眠 %.0f 分钟, 下次: %s (%s持仓)",
+                    sleep_seconds / 60,
+                    wakeup_at.strftime("%m-%d %H:%M:%S"),
+                    "有" if has_pos else "无",
+                )
+                await asyncio.sleep(sleep_seconds)
+                async with self._scan_lock:
+                    await self.run_once()
+
+        poller_task = asyncio.create_task(poller_loop())
+        main_task = asyncio.create_task(main_loop())
+
+        try:
+            await asyncio.gather(poller_task, main_task)
+        except Exception:
+            poller_task.cancel()
+            main_task.cancel()
+            raise
 
     def _write_dashboard(
         self,
@@ -2915,7 +3381,7 @@ class FundingArbitrageBot:
             <div class="card total"><div class="label">合计</div><div class="value">{total_usdt:,.2f}</div></div>
         </div>"""
 
-        # --- 持仓状态 ---
+        # --- 当前持仓 ---
         if has_position and self.state.is_open:
             pos_notional = self.state.amount * self.state.entry_price
             est_profit = pos_notional * self.state.net_rate
@@ -2940,11 +3406,26 @@ class FundingArbitrageBot:
             </div>
         </div>"""
         else:
-            position_html = """
+            pre_borrow_html = ""
+            if self.state.pre_borrow_base:
+                elapsed = (datetime.now(tz=self.tz) - datetime.fromisoformat(
+                    self.state.pre_borrow_at)).total_seconds() / 60
+                pre_borrow_html = f"""
+        <div class="section">
+            <h2>预借等待中</h2>
+            <div class="position reverse">
+                <span class="badge reverse">反向</span>
+                <strong>{self.state.pre_borrow_base}</strong>
+                <span>数量: {self.state.pre_borrow_amount}</span>
+                <span>已等待: {elapsed:.0f} / {PRE_BORROW_TIMEOUT_MINUTES} min</span>
+            </div>
+        </div>"""
+            position_html = f"""
         <div class="section">
             <h2>当前持仓</h2>
             <p class="muted">无持仓</p>
-        </div>"""
+        </div>
+        {pre_borrow_html}"""
 
         # --- Top 10 表格 ---
         rows_html = ""
