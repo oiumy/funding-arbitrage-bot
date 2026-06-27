@@ -12,3 +12,10 @@ GATE_API_SECRET = "你的 Gate.io API Secret"
 # ── 通知 ──
 NOTIFY_EMAIL = "你的QQ号@qq.com"
 NOTIFY_EMAIL_AUTH = "QQ邮箱SMTP授权码"
+
+# ── 策略模式 ──
+# 跨交易所资金费率差异套利：--cross 启动
+# 单交易所套利（BN/GT 独立）：不加 --cross 即可（默认模式）
+# 用法示例：
+#   python funding_arbitrage_bot.py --cross --scan   # 查看跨所机会
+#   python funding_arbitrage_bot.py --cross --live    # 跨所实盘
