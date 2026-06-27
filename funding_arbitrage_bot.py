@@ -181,6 +181,12 @@ CROSS_SNIPE_WINDOW_SEC = 85              # 距结算≤N秒时跳过单所扫描
 CROSS_MIN_RATE_SPREAD = 0.0003          # 最小原始费率差 0.03%
 CROSS_MIN_NET_RATE = 0.0001             # 最小净收益率 0.01%（扣双边手续费后）
 
+# 手续费折扣/返佣系数（实际手续费 = 标称 × BNB抵扣 × 返佣）
+BN_FEE_DISCOUNT_FACTOR = 0.9   # BNB抵扣合约手续费10%
+BN_FEE_REBATE_FACTOR = 1.0     # 返佣，1.0=无，0.8=返20%
+GT_FEE_DISCOUNT_FACTOR = 1.0   # Gate无BNB抵扣
+GT_FEE_REBATE_FACTOR = 0.36    # 返佣64%，实付36%
+
 CROSS_LIQ_DISTANCE_MIN = 0.10            # 跨所强平距离阈值 10%（1x杠杆几乎不可能触发）
 
 # Binance Alpha (pre-listing spot) API.
@@ -4546,50 +4552,73 @@ class FundingArbitrageBot:
         """从订单响应中提取成交均价。"""
         if not order:
             return 0.0
-        if "avgPrice" in order and order["avgPrice"]:
-            return float(order["avgPrice"])
-        if "cummulativeQuoteQty" in order and "executedQty" in order:
-            qty = float(order["executedQty"])
-            if qty > 0:
-                return float(order["cummulativeQuoteQty"]) / qty
+        for src in (order.get("info", {}), order):
+            avg = src.get("avgPrice")
+            if avg:
+                return float(avg)
+            qq = src.get("cummulativeQuoteQty")
+            eq = src.get("executedQty")
+            if qq and eq:
+                qty = float(eq)
+                if qty > 0:
+                    return float(qq) / qty
         for key in ("price", "fill_price", "average"):
             if order.get(key):
                 return float(order[key])
         return 0.0
 
     def _record_cross_trade(self, short_exit: float = 0.0, long_exit: float = 0.0) -> None:
-        """记录跨交易所套利交易到 trade_history。计算真实盈亏。"""
+        """记录跨交易所套利交易到 trade_history。按交易所拆分真实盈亏。"""
         cs = self.cross_state
         if not cs.is_open or cs.amount <= 0:
             return
         amount = cs.amount
         short_entry = cs.short_entry_price
         long_entry = cs.long_entry_price
-
-        # 价格盈亏
-        price_pnl = round(amount * (short_entry - short_exit) + amount * (long_exit - long_entry), 6)
-
-        # 资费盈亏（估算：名义价值 × 费率）
         short_notional = amount * short_entry if short_entry else 0
         long_notional = amount * long_entry if long_entry else 0
-        funding_short = abs(short_notional * cs.short_rate)  # 做空收取资费
-        funding_long = abs(long_notional * cs.long_rate)     # 做多支付资费
-        funding_pnl = round(funding_short - funding_long, 6)
 
-        # 手续费（双边开平）
+        # 费率、抵扣、返佣查找表
         bn_fee, gt_fee = getattr(self, "_dash_cross_fees", (0.00045, 0.00018))
-        short_fee_rate = bn_fee if cs.short_exchange == "binance" else gt_fee
-        long_fee_rate = gt_fee if cs.long_exchange == "gate" else bn_fee
-        fee_total = round((short_notional * short_fee_rate + long_notional * long_fee_rate) * 2, 6)
+        _fee_of = {"binance": bn_fee, "gate": gt_fee}
+        _dsc_of = {"binance": BN_FEE_DISCOUNT_FACTOR, "gate": GT_FEE_DISCOUNT_FACTOR}
+        _rbt_of = {"binance": BN_FEE_REBATE_FACTOR, "gate": GT_FEE_REBATE_FACTOR}
 
-        net_pnl = round(price_pnl + funding_pnl - fee_total, 6)
+        short_fee_rate = _fee_of.get(cs.short_exchange, bn_fee)
+        long_fee_rate = _fee_of.get(cs.long_exchange, gt_fee)
+
+        # ── 做空侧（高费率所）──
+        short_price_pnl = round(amount * (short_entry - short_exit), 6)
+        short_funding_pnl = round(short_notional * cs.short_rate, 6)
+        short_fee_gross = round(short_notional * short_fee_rate * 2, 6)
+        short_fee_actual = round(short_fee_gross
+                                 * _dsc_of.get(cs.short_exchange, 1.0)
+                                 * _rbt_of.get(cs.short_exchange, 1.0), 6)
+        short_net = round(short_price_pnl + short_funding_pnl - short_fee_actual, 6)
+
+        # ── 做多侧（低费率所）──
+        long_price_pnl = round(amount * (long_exit - long_entry), 6)
+        long_funding_pnl = round(-long_notional * cs.long_rate, 6)
+        long_fee_gross = round(long_notional * long_fee_rate * 2, 6)
+        long_fee_actual = round(long_fee_gross
+                                * _dsc_of.get(cs.long_exchange, 1.0)
+                                * _rbt_of.get(cs.long_exchange, 1.0), 6)
+        long_net = round(long_price_pnl + long_funding_pnl - long_fee_actual, 6)
+
+        net_pnl = round(short_net + long_net, 6)
 
         self._write_cross_trade_record(
             cs.base, f"cross({cs.short_exchange}空+{cs.long_exchange}多)",
             cs.amount, cs.short_entry_price, cs.total_net_rate, cs.rate_spread,
             short_entry=short_entry, short_exit=short_exit,
             long_entry=long_entry, long_exit=long_exit,
-            price_pnl=price_pnl, funding_pnl=funding_pnl, fee_total=fee_total, net_pnl=net_pnl)
+            net_pnl=net_pnl,
+            short_exchange=cs.short_exchange, short_price_pnl=short_price_pnl,
+            short_funding_pnl=short_funding_pnl,
+            short_fee=short_fee_gross, short_actual_fee=short_fee_actual, short_net=short_net,
+            long_exchange=cs.long_exchange, long_price_pnl=long_price_pnl,
+            long_funding_pnl=long_funding_pnl,
+            long_fee=long_fee_gross, long_actual_fee=long_fee_actual, long_net=long_net)
 
     def _write_cross_trade_record(self, coin: str, direction: str, amount: float,
                                    entry_price: float, net_rate: float, rate_spread: float,
@@ -5051,9 +5080,7 @@ class FundingArbitrageBot:
 
     async def _update_cross_dashboard(self, bn_fut_bal: float, gt_fut_bal: float) -> None:
         """在跨所模式下填充看板余额变量。"""
-        self._dash_spot_usdt = 0.0
         self._dash_futures_usdt = bn_fut_bal
-        self._dash_margin_total = 0.0
         # 用总余额(含锁定保证金)，避免开仓后曲线骤降
         bn_total, gt_total = await asyncio.gather(
             self._cross_get_bn_total_balance(),
@@ -5061,13 +5088,7 @@ class FundingArbitrageBot:
         )
         self._dash_total_usdt = bn_total
         self._dash_gate_spot = gt_total
-        self._dash_gate_fut = gt_fut_bal
         self._dash_gate_df = pd.DataFrame()
-        if self.cross_state.is_open:
-            cs = self.cross_state
-            self._dash_position_usdt = cs.amount * cs.short_entry_price
-        else:
-            self._dash_position_usdt = 0.0
 
     async def run_once(self, force_entry: bool = False) -> None:
         """执行一次持仓检查、全市场扫描和开仓/平仓判断。
@@ -5296,13 +5317,9 @@ class FundingArbitrageBot:
                                    futures_usdt, margin_total, total_usdt, position_usdt)
 
         # 缓存仪表盘数据
-        self._dash_spot_usdt = spot_usdt
         self._dash_futures_usdt = futures_usdt
-        self._dash_margin_total = margin_total
         self._dash_total_usdt = total_usdt
-        self._dash_position_usdt = position_usdt
         self._dash_df = df
-        self._dash_has_position = has_position
 
     async def _run_once_gate(self, has_binance: bool, has_gate: bool) -> None:
         """Gate.io 独立交易循环。"""
@@ -5330,7 +5347,6 @@ class FundingArbitrageBot:
             gate_spot_usdt = await self._gate_spot_balance()
         except Exception:
             gate_spot_usdt = 0.0
-        gate_fut_usdt = 0.0  # 单币种保证金模式，现货即总余额
         gate_position_usdt = (gate_spot_usdt / 2) * POSITION_SIZE_RATIO if gate_spot_usdt > 0 else 100.0
 
         logger.info("[Gate] 账户余额: %.2f USDT (统一账户)", gate_spot_usdt)
@@ -5391,7 +5407,6 @@ class FundingArbitrageBot:
 
         # 缓存 Gate 仪表盘数据（单币种保证金：现货即总余额）
         self._dash_gate_spot = gate_spot_usdt
-        self._dash_gate_fut = 0.0
         self._dash_gate_df = gdf
 
     async def _trade_decision(self, df: pd.DataFrame, exchange: str,
@@ -5741,11 +5756,8 @@ class FundingArbitrageBot:
                 else:
                     df = pd.DataFrame()
 
-                self._dash_spot_usdt = spot_usdt
                 self._dash_futures_usdt = futures_usdt
-                self._dash_margin_total = margin_total
                 self._dash_total_usdt = total_usdt
-                self._dash_position_usdt = position_usdt
                 self._dash_df = df
             except Exception:
                 pass
@@ -5767,7 +5779,6 @@ class FundingArbitrageBot:
                 else:
                     gdf = pd.DataFrame()
                 self._dash_gate_spot = gate_spot_usdt
-                self._dash_gate_fut = 0.0
                 self._dash_gate_df = gdf
             except Exception:
                 pass
@@ -5776,14 +5787,10 @@ class FundingArbitrageBot:
 
     def _write_dashboard(self) -> None:
         """生成手机端自适应 Dashboard。含盈亏日历、资金曲线。"""
-        spot_usdt = getattr(self, "_dash_spot_usdt", 0.0)
         futures_usdt = getattr(self, "_dash_futures_usdt", 0.0)
-        margin_total = getattr(self, "_dash_margin_total", 0.0)
         total_usdt = getattr(self, "_dash_total_usdt", 0.0)
-        position_usdt = getattr(self, "_dash_position_usdt", 0.0)
         df = getattr(self, "_dash_df", pd.DataFrame())
         gate_spot = getattr(self, "_dash_gate_spot", 0.0)
-        gate_fut = getattr(self, "_dash_gate_fut", 0.0)
         gate_df = getattr(self, "_dash_gate_df", pd.DataFrame())
         cross_df = getattr(self, "_dash_cross_df", pd.DataFrame())
 
@@ -5813,17 +5820,45 @@ class FundingArbitrageBot:
 
         # ── 交易历史 & 累计盈亏 ──
         history = self._load_trade_history()
-        total_profit = sum(h["profit_usdt"] for h in history)
+
+        def _get_real_pnl(h: dict) -> float:
+            """真实净盈亏：优先用 net_pnl，旧记录回退 profit_usdt。"""
+            n = h.get("net_pnl")
+            if n is not None:
+                return float(n)
+            return float(h.get("profit_usdt", 0) or 0)
+
+        total_profit = sum(_get_real_pnl(h) for h in history)
         profit_cls = "positive" if total_profit >= 0 else "negative"
 
-        # 月度盈亏：按日期汇总
+        # 累计分项：平仓盈亏 / 资费 / 手续费
+        cum_price = 0.0
+        cum_funding = 0.0
+        cum_fee_gross = 0.0
+        cum_fee_actual = 0.0
+        for h in history:
+            if "short_exchange" in h:
+                cum_price += (h.get("short_price_pnl", 0) or 0) + (h.get("long_price_pnl", 0) or 0)
+                cum_funding += (h.get("short_funding_pnl", 0) or 0) + (h.get("long_funding_pnl", 0) or 0)
+                sf = (h.get("short_actual_fee") or h.get("short_fee")) or 0
+                lf = (h.get("long_actual_fee") or h.get("long_fee")) or 0
+                cum_fee_actual += sf + lf
+                cum_fee_gross += (h.get("short_fee", 0) or 0) + (h.get("long_fee", 0) or 0)
+            elif "price_pnl" in h:
+                cum_price += (h.get("price_pnl", 0) or 0)
+                cum_funding += (h.get("funding_pnl", 0) or 0)
+                cum_fee_actual += (h.get("fee_total", 0) or 0)
+                cum_fee_gross += (h.get("fee_total", 0) or 0)
+
+        # 月度盈亏：按日期汇总（使用真实净盈亏）
         month_pnl: dict[str, float] = {}
         for h in history:
+            ts = h.get("ts") or h.get("time", "")
             try:
-                d = datetime.fromisoformat(h["ts"]).strftime("%Y-%m-%d")
+                d = ts[:10]  # YYYY-MM-DD
             except (ValueError, KeyError):
                 continue
-            month_pnl[d] = month_pnl.get(d, 0) + h["profit_usdt"]
+            month_pnl[d] = month_pnl.get(d, 0) + _get_real_pnl(h)
 
         # 当日盈亏
         today_str = now.strftime("%Y-%m-%d")
@@ -5833,11 +5868,18 @@ class FundingArbitrageBot:
         # ── 统计 ──
         total_trades = len(history)
         if total_trades > 0:
-            wins = sum(1 for h in history if h["profit_usdt"] > 0)
+            wins = sum(1 for h in history if _get_real_pnl(h) > 0)
             win_rate = wins / total_trades * 100
-            best = max(h["profit_usdt"] for h in history)
-            worst = min(h["profit_usdt"] for h in history)
-            stats_html = f"""<div class="stats"><span>总交易 <b>{total_trades}</b> 笔</span><span>胜率 <b>{win_rate:.0f}%</b></span><span>累计 <b class="{profit_cls}">{total_profit:+.4f}</b></span><span>最佳 <b class="positive">+{best:.4f}</b></span><span>最差 <b class="negative">{worst:.4f}</b></span></div>"""
+            best = max(_get_real_pnl(h) for h in history)
+            worst = min(_get_real_pnl(h) for h in history)
+            stats_html = (
+                f'<div class="stats">'
+                f'<span>总交易 <b>{total_trades}</b> 笔</span>'
+                f'<span>胜率 <b>{win_rate:.0f}%</b></span>'
+                f'<span>累计 <b class="{profit_cls}">{total_profit:+.4f}</b></span>'
+                f'<span>最佳 <b class="positive">+{best:.4f}</b></span>'
+                f'<span>最差 <b class="negative">{worst:.4f}</b></span>'
+                f'</div>')
         else:
             stats_html = '<div class="stats"><span>暂无交易记录</span></div>'
 
@@ -5881,13 +5923,15 @@ class FundingArbitrageBot:
             <div class="card total"><div class="label">总计</div><div class="value" style="color:#f0b90b">{grand_total:,.2f}</div></div>"""
         balance_cards = f"""
         <div class="balances">
-            <div class="card"><div class="label">BN 现货</div><div class="value">{spot_usdt:,.2f}</div></div>
             <div class="card"><div class="label">BN 合约</div><div class="value">{futures_usdt:,.2f}</div></div>
-            <div class="card"><div class="label">BN 杠杆</div><div class="value">{margin_total:,.2f}</div></div>
             <div class="card"><div class="label">BN 合计</div><div class="value">{total_usdt:,.2f}</div></div>
             {gate_cards}
             <div class="card"><div class="label">累计盈亏</div><div class="value {profit_cls}">{total_profit:+.4f}</div></div>
             <div class="card"><div class="label">今日盈亏</div><div class="value {today_cls}">{today_pnl:+.4f}</div></div>
+            <div class="card"><div class="label">平仓盈亏</div><div class="value {"positive" if cum_price>=0 else "negative"}">{cum_price:+.4f}</div></div>
+            <div class="card"><div class="label">累计资费</div><div class="value {"positive" if cum_funding>=0 else "negative"}">{cum_funding:+.4f}</div></div>
+            <div class="card"><div class="label">手续费(标称)</div><div class="value negative">{cum_fee_gross:.4f}</div></div>
+            <div class="card"><div class="label">手续费(实付)</div><div class="value negative">{cum_fee_actual:.4f}</div></div>
         </div>"""
 
         # ── 当前持仓 ──
@@ -6012,7 +6056,7 @@ class FundingArbitrageBot:
         if history:
             recent = history[-20:][::-1]
             rows = ""
-            has_detailed = any("price_pnl" in h for h in history)
+            has_detailed = any("price_pnl" in h or "short_exchange" in h for h in history)
             for h in recent:
                 ts_raw = h.get("ts") or h.get("time", "")
                 ts_short = ts_raw[:16].replace("T", " ")
@@ -6025,12 +6069,56 @@ class FundingArbitrageBot:
                     tag_cls = "reverse" if direction == "reverse" else "forward"
                 amount = float(h.get("amount", 0))
                 amount_str = f"{amount:.4f}" if amount else "-"
-                price_pnl = h.get("price_pnl", 0) or 0
-                funding_pnl = h.get("funding_pnl", 0) or 0
-                fee_total = h.get("fee_total", 0) or 0
                 net_pnl = h.get("net_pnl", h.get("profit_usdt", 0)) or 0
                 pnl_cls = "positive" if net_pnl >= 0 else "negative"
-                if "price_pnl" in h:
+                # 新版跨所记录：按交易所拆分
+                if "short_exchange" in h:
+                    short_ex = h.get("short_exchange", "")
+                    long_ex = h.get("long_exchange", "")
+                    sp = h.get("short_price_pnl", 0) or 0
+                    sf = h.get("short_funding_pnl", 0) or 0
+                    sfe = h.get("short_fee", 0) or 0
+                    sfa = h.get("short_actual_fee") or sfe  # 兼容旧记录
+                    sn = h.get("short_net", 0) or 0
+                    lp = h.get("long_price_pnl", 0) or 0
+                    lf = h.get("long_funding_pnl", 0) or 0
+                    lfe = h.get("long_fee", 0) or 0
+                    lfa = h.get("long_actual_fee") or lfe
+                    ln = h.get("long_net", 0) or 0
+                    s_exit = h.get("short_exit") or 0
+                    l_exit = h.get("long_exit") or 0
+                    cd1 = f"{s_exit:.4f}" if s_exit else "-"
+                    cd2 = f"{l_exit:.4f}" if l_exit else "-"
+                    # 分组头行：时间/类型/币种/数量 + 汇总净盈亏
+                    rows += (f'<tr class="cross-group"><td>{ts_short}</td>'
+                             f'<td><span class="badge cross">跨所</span></td>'
+                             f'<td>{h["coin"]}</td>'
+                             f'<td class="right">{amount_str}</td>'
+                             f'<td class="right muted" colspan="3">平仓价 {short_ex}空{cd1} / {long_ex}多{cd2}</td>'
+                             f'<td class="right {pnl_cls}"><b>{net_pnl:+.4f}</b></td></tr>')
+                    s_cls = "bn" if short_ex == "binance" else "gt"
+                    l_cls = "bn" if long_ex == "binance" else "gt"
+                    # 做空侧: 价格盈亏 / 资费 / 手续费(标称/实付) / 净盈亏
+                    rows += (f'<tr class="cross-sub"><td></td>'
+                             f'<td class="right"><span class="badge {s_cls}">{short_ex}空</span></td>'
+                             f'<td></td><td class="right"></td>'
+                             f'<td class="right {"positive" if sp>=0 else "negative"}">{sp:+.4f}</td>'
+                             f'<td class="right {"positive" if sf>=0 else "negative"}">{sf:+.4f}</td>'
+                             f'<td class="right negative">{sfe:.4f}<span class="muted">/{sfa:.4f}</span></td>'
+                             f'<td class="right {"positive" if sn>=0 else "negative"}">{sn:+.4f}</td></tr>')
+                    # 做多侧
+                    rows += (f'<tr class="cross-sub"><td></td>'
+                             f'<td class="right"><span class="badge {l_cls}">{long_ex}多</span></td>'
+                             f'<td></td><td class="right"></td>'
+                             f'<td class="right {"positive" if lp>=0 else "negative"}">{lp:+.4f}</td>'
+                             f'<td class="right {"positive" if lf>=0 else "negative"}">{lf:+.4f}</td>'
+                             f'<td class="right negative">{lfe:.4f}<span class="muted">/{lfa:.4f}</span></td>'
+                             f'<td class="right {"positive" if ln>=0 else "negative"}">{ln:+.4f}</td></tr>')
+                elif "price_pnl" in h:
+                    # 旧版跨所记录（无拆分）：直接展示汇总
+                    price_pnl = h.get("price_pnl", 0) or 0
+                    funding_pnl = h.get("funding_pnl", 0) or 0
+                    fee_total = h.get("fee_total", 0) or 0
                     rows += (f'<tr><td>{ts_short}</td>'
                              f'<td><span class="badge {tag_cls}">{tag}</span></td>'
                              f'<td>{h["coin"]}</td>'
@@ -6048,7 +6136,7 @@ class FundingArbitrageBot:
                              f'<td class="right">-</td><td class="right">-</td><td class="right">-</td>'
                              f'<td class="right {pnl_cls}">{pnl:+.4f}</td></tr>')
             if has_detailed:
-                header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">数量</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费</th><th class="right">净盈亏</th></tr>'
+                header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">数量</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费(标称/实付)</th><th class="right">净盈亏</th></tr>'
             else:
                 header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">数量</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费</th><th class="right">净盈亏</th></tr>'
             recent_html = f"""
@@ -6149,6 +6237,8 @@ class FundingArbitrageBot:
                 pass_cls = "pass" if passes else "fail"
                 bn_p = float(row.get("bn_price", 0))
                 gt_p = float(row.get("gt_price", 0))
+                short_cls = "bn" if short_ex == "binance" else "gt"
+                long_cls = "bn" if long_ex == "binance" else "gt"
                 cross_rows_html += f"""
                 <tr class="{'held' if held else ''}">
                     <td><span class="{pass_cls}">{pass_mark}</span></td>
@@ -6157,10 +6247,10 @@ class FundingArbitrageBot:
                     <td class="right">{gt_p:.6f}</td>
                     <td class="right">{rate_spread*100:+.4f}%</td>
                     <td class="right {net_cls}">{net_rate*100:+.4f}%</td>
-                    <td><span class="badge bn">{short_ex.upper()}</span></td>
+                    <td><span class="badge {short_cls}">{short_ex.upper()}</span></td>
                     <td class="right">{short_rate*100:+.4f}%</td>
                     <td class="right">{s_countdown}</td>
-                    <td><span class="badge gt">{long_ex.upper()}</span></td>
+                    <td><span class="badge {long_cls}">{long_ex.upper()}</span></td>
                     <td class="right">{long_rate*100:+.4f}%</td>
                     <td class="right">{l_countdown}</td>
                 </tr>"""
@@ -6239,6 +6329,10 @@ th {{ color: #888; font-weight: 600; position: sticky; top: 0; background: #1a1a
 .negative {{ color: #e05560; font-weight: 600; }}
 .muted {{ color: #666; }}
 tr.held {{ background: #1e2a1e; }}
+tr.cross-group {{ border-top: 2px solid #444; }}
+tr.cross-group td {{ padding-top: 12px; }}
+tr.cross-sub td {{ color: #999; font-size: 0.85em; padding: 1px 6px; }}
+tr.cross-sub td:first-child {{ padding-left: 16px; }}
 .footer {{ text-align: center; color: #444; font-size: 0.65rem; margin-top: 12px; }}
 .cal-nav {{ background: none; border: 1px solid #444; color: #aaa; border-radius: 4px; padding: 2px 8px; font-size: 0.8rem; cursor: pointer; }}
 .cal-nav:hover {{ background: #252540; }}
