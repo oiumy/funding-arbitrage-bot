@@ -23,6 +23,7 @@ import math
 import os
 import time
 import urllib.request
+import requests
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -110,7 +111,7 @@ MIN_SPOT_24H_QUOTE_VOLUME = 1_000_000
 # 只在实际结算前 ENTRY_WINDOW_MINUTES 分钟内才开仓，过早开的费率不可靠。
 # 平仓: 开仓时记录合约的 nextFundingTime，结算后 +1 分钟平仓。
 LOCAL_TIMEZONE = "Asia/Shanghai"
-SCAN_INTERVAL_MINUTES = 1   # 无持仓时多久扫一次 (1分钟确保不错过窗口)
+SCAN_INTERVAL_MINUTES = 0.5 # 无持仓时多久扫一次 (30s，配合60s窗口确保不漏)
 ENTRY_WINDOW_MINUTES = 2    # 距结算前多少分钟才允许开仓 (留足扫描+下单时间)
 DEFAULT_FUNDING_INTERVAL_HOURS = 8  # 获取结算时间失败时的兜底估算
 
@@ -176,8 +177,10 @@ GATE_TRADING_ENABLED = True              # Gate.io 实盘交易总开关，--no-
 CROSS_EXCHANGE_ENABLED = True            # 跨所套利开关（默认开，--cross 强制开）
 CROSS_SHOW_SINGLE = True                # 跨所模式下同时展示单交易所套利机会（仅扫描，不下单）
 CROSS_POSITION_SIZE_RATIO = 0.98        # 跨所资金利用率（纯期货对冲，价格风险中性，可更高）
-CROSS_SNIPER_OFFSET_SEC = 5              # 结算前N秒扫描+开仓
-CROSS_SNIPE_WINDOW_SEC = 85              # 距结算≤N秒时跳过单所扫描，直接狙击（须 > 完整周期14s + 休眠60s）
+CROSS_SNIPER_SCAN_OFFSET_SEC = 10         # 结算前N秒扫描（获取最新费率）
+CROSS_SNIPER_OPEN_OFFSET_MS = 1000         # 结算前N毫秒发出开仓（从容下单）
+CROSS_LEVERAGE = 1                        # 跨所套利用的合约杠杆倍数
+CROSS_SNIPE_WINDOW_SEC = 60              # 距结算≤N秒时跳过单所扫描，直接狙击
 CROSS_MIN_RATE_SPREAD = 0.0003          # 最小原始费率差 0.03%
 CROSS_MIN_NET_RATE = 0.0001             # 最小净收益率 0.01%（扣双边手续费后）
 
@@ -299,11 +302,13 @@ class FundingArbitrageBot:
         self.gate_futures = self._create_gate_futures_exchange()
         self._alpha_tokens: dict[str, dict[str, Any]] = {}
         self._alpha_last_fetch: float = 0.0
+        self._rest_session = requests.Session()  # Binance 直连 REST 持久连接池
         self._scan_lock = asyncio.Lock()  # 防止预借和主扫描冲突
         self._borrow_blacklist: dict[str, float] = {}  # base → 过期时间戳, 借币池空后暂避
         self._fee_cache: dict[str, tuple[float, Any]] = {}  # key → (ts, result), 避免同轮重复查询
         self._gate_margin_bases: list[str] = []  # Gate 可借贷币种列表缓存
         self._gate_margin_bases_ts: float = 0.0
+        self._leverage_set: set[tuple[str, str, int]] = set()  # 已设杠杆缓存 (exchange, symbol, leverage)
         self._fee_lock = asyncio.Lock()
 
     @staticmethod
@@ -482,7 +487,8 @@ class FundingArbitrageBot:
         )
 
     async def close(self) -> None:
-        """关闭 ccxt 异步会话。"""
+        """关闭 ccxt 异步会话与 REST 连接池。"""
+        self._rest_session.close()
         await asyncio.gather(
             self._safe_request("spot.close", lambda: self.spot.close()),
             self._safe_request("futures.close", lambda: self.futures.close()),
@@ -643,7 +649,6 @@ class FundingArbitrageBot:
         params: dict | None = None, method: str = "GET",
     ) -> dict[str, Any]:
         """向币安官方 REST API 发签名请求，返回 JSON."""
-        import requests as _requests
 
         params = dict(params or {})
         params["timestamp"] = int(time.time() * 1000)
@@ -656,7 +661,7 @@ class FundingArbitrageBot:
             proxies = (
                 {"http": HTTP_PROXY, "https": HTTP_PROXY} if HTTP_PROXY else None
             )
-            resp = _requests.request(
+            resp = self._rest_session.request(
                 method, url,
                 headers={"X-MBX-APIKEY": BINANCE_API_KEY},
                 proxies=proxies,
@@ -1781,6 +1786,9 @@ class FundingArbitrageBot:
             passes = True
             if rate_spread < CROSS_MIN_RATE_SPREAD:
                 passes = False
+            elif bn_nft > 0 and gt_nft > 0 and abs(bn_nft - gt_nft) > 5000:
+                # 两所结算时间差>5s：如 BN 8h / GT 4h，不同步无法套利
+                passes = False
             elif bn_nft > 0 and not self._within_entry_window(bn_nft):
                 passes = False
             elif gt_nft > 0 and not self._within_entry_window(gt_nft):
@@ -1808,6 +1816,8 @@ class FundingArbitrageBot:
                 "long_fee": long_fee,
                 "short_next_funding_time_ms": short_nft,
                 "long_next_funding_time_ms": long_nft,
+                "short_price": bn_price if short_ex == "binance" else gt_price,
+                "long_price": bn_price if long_ex == "binance" else gt_price,
                 "bn_price": bn_price,
                 "gt_price": gt_price,
                 "passes": passes,
@@ -2202,7 +2212,7 @@ class FundingArbitrageBot:
     async def _gate_set_leverage(self, symbol: str) -> bool:
         """Gate 合约设置杠杆 1x。"""
         try:
-            await self.gate_futures.set_leverage(1, symbol)
+            await self.gate_futures.set_leverage(CROSS_LEVERAGE, symbol)
             return True
         except Exception as exc:
             logger.warning("Gate 设置杠杆失败 %s: %s", symbol, exc)
@@ -2214,7 +2224,7 @@ class FundingArbitrageBot:
             clean = self._clean_futures_symbol(symbol)
             await self._binance_request(
                 BINANCE_FUTURES_API, "/fapi/v1/leverage",
-                {"symbol": clean, "leverage": 1}, method="POST",
+                {"symbol": clean, "leverage": CROSS_LEVERAGE}, method="POST",
             )
             return True
         except Exception as exc:
@@ -2977,11 +2987,10 @@ class FundingArbitrageBot:
     async def _fetch_premium_index_all(self) -> list[dict[str, Any]]:
         """查询全部 USDT 永续合约溢价指数 (含资金费率). 公开接口无需签名.
         返回 [{"symbol": "BTCUSDT", "markPrice": "...", "lastFundingRate": "...", ...}, ...]"""
-        import requests as _requests
         url = f"{BINANCE_FUTURES_API}/fapi/v1/premiumIndex"
         def _do():
             proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY} if HTTP_PROXY else None
-            resp = _requests.get(url, proxies=proxies, timeout=15)
+            resp = self._rest_session.get(url, proxies=proxies, timeout=15)
             resp.raise_for_status()
             return resp.json()
         try:
@@ -4233,10 +4242,23 @@ class FundingArbitrageBot:
             logger.warning("验证币安持仓失败 %s: %s", symbol, exc)
         return 0.0
 
-    async def _cross_open_short_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """在指定交易所做空合约（开仓前设 1x 杠杆）。"""
+    async def _cross_ensure_leverage(self, exchange: str, symbol: str) -> None:
+        """确保合约杠杆已设为 CROSS_LEVERAGE（同币种同倍数只设一次，失败不缓存下次重试）。"""
+        key = (exchange, symbol, CROSS_LEVERAGE)
+        if key in self._leverage_set:
+            return
+        ok = False
         if exchange == "binance":
-            await self._binance_set_leverage(symbol)
+            ok = await self._binance_set_leverage(symbol)
+        else:
+            ok = await self._gate_set_leverage(symbol)
+        if ok:
+            self._leverage_set.add(key)
+
+    async def _cross_open_short_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
+        """在指定交易所做空合约。"""
+        await self._cross_ensure_leverage(exchange, symbol)
+        if exchange == "binance":
             try:
                 order = await self._binance_futures_order(symbol, "sell", amount, position_side="SHORT")
                 return LegResult(True, "futures", symbol, "sell", amount, order=order)
@@ -4253,7 +4275,6 @@ class FundingArbitrageBot:
                 logger.error("合约开空确认失败 %s: %s", symbol, exc)
                 return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
         else:
-            await self._gate_set_leverage(symbol)
             try:
                 order = await self._gate_futures_order(symbol, "sell", amount)
                 ok = order.get("status") == "closed"
@@ -4269,8 +4290,8 @@ class FundingArbitrageBot:
 
     async def _cross_open_long_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
         """在指定交易所做多合约（开仓前设 1x 杠杆）。"""
+        await self._cross_ensure_leverage(exchange, symbol)
         if exchange == "binance":
-            await self._binance_set_leverage(symbol)
             try:
                 order = await self._binance_futures_order(symbol, "buy", amount, position_side="LONG")
                 return LegResult(True, "futures", symbol, "buy", amount, order=order)
@@ -4287,7 +4308,6 @@ class FundingArbitrageBot:
                 logger.error("合约开多确认失败 %s: %s", symbol, exc)
                 return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
         else:
-            await self._gate_set_leverage(symbol)
             try:
                 order = await self._gate_futures_order(symbol, "buy", amount)
                 ok = order.get("status") == "closed"
@@ -4376,77 +4396,24 @@ class FundingArbitrageBot:
             logger.error("[跨交易所] %s 精度计算失败 %s: %s", exchange, symbol, exc)
             return 0.0
 
-    async def _open_cross_exchange_position(self, row: pd.Series) -> bool:
-        """开仓跨交易所套利：高费率所做空 + 低费率所做多。"""
-        base = str(row["base"])
-        short_ex = str(row["short_exchange"])
-        long_ex = str(row["long_exchange"])
-        short_sym = str(row["short_symbol"])
-        long_sym = str(row["long_symbol"])
-
-        # 获取两所合约余额
-        bn_bal, gt_bal = await asyncio.gather(
-            self._cross_get_bn_futures_balance(),
-            self._gate_futures_balance(),
-        )
-        short_bal = bn_bal if short_ex == "binance" else gt_bal
-        long_bal = bn_bal if long_ex == "binance" else gt_bal
-
-        if short_bal <= 0 or long_bal <= 0:
-            logger.error("[跨交易所] 余额不足: BN=%.2f GT=%.2f", bn_bal, gt_bal)
-            return False
-
-        # 取较小余额计算统一仓位
-        common_usdt = min(short_bal, long_bal) * POSITION_SIZE_RATIO
-        if common_usdt <= 0:
-            logger.error("[跨交易所] 可用仓位为 0")
-            return False
-
-        # 获取两所价格（两所价格可能不同，各用各的算数量）
-        short_ex_obj = self.futures if short_ex == "binance" else self.gate_futures
-        long_ex_obj = self.futures if long_ex == "binance" else self.gate_futures
-        short_ticker, long_ticker = await asyncio.gather(
-            self._safe_request(f"cross_ticker_{short_ex}",
-                               lambda: short_ex_obj.fetch_ticker(short_sym), default=None),
-            self._safe_request(f"cross_ticker_{long_ex}",
-                               lambda: long_ex_obj.fetch_ticker(long_sym), default=None),
-        )
-        short_price = float(short_ticker["last"]) if short_ticker and short_ticker.get("last") else 0
-        long_price = float(long_ticker["last"]) if long_ticker and long_ticker.get("last") else 0
-        if short_price <= 0 or long_price <= 0:
-            logger.error("[跨交易所] 获取价格失败: %s=%.6f %s=%.6f", short_ex, short_price, long_ex, long_price)
-            return False
-
-        # 分别按各所价格 + 余额算数量，取较小值保证两边都够
-        short_notional = short_bal * POSITION_SIZE_RATIO
-        long_notional = long_bal * POSITION_SIZE_RATIO
-        short_qty = await self._cross_calculate_amount(short_ex, short_sym, short_price, short_notional)
-        long_qty = await self._cross_calculate_amount(long_ex, long_sym, long_price, long_notional)
-        if short_qty <= 0 or long_qty <= 0:
-            return False
-        amount = min(short_qty, long_qty)
-        # 用实际价格反算，确认两边都不超
-        est_short_usdt = amount * short_price
-        est_long_usdt = amount * long_price
-        if est_short_usdt > short_bal * POSITION_SIZE_RATIO * 1.1 or est_long_usdt > long_bal * POSITION_SIZE_RATIO * 1.1:
-            logger.error("[跨交易所] 数量超限: short≈%.2f long≈%.2f USDT", est_short_usdt, est_long_usdt)
-            return False
-
-        # 币安合约最低名义价值 5 USDT，低于此值会报 -4164
-        MIN_CROSS_NOTIONAL = 5.5
-        if est_short_usdt < MIN_CROSS_NOTIONAL or est_long_usdt < MIN_CROSS_NOTIONAL:
-            logger.warning("[跨交易所] 仓位太小: short≈%.2f long≈%.2f USDT < %.1f，跳过",
-                           est_short_usdt, est_long_usdt, MIN_CROSS_NOTIONAL)
-            return False
-
+    async def _open_cross_exchange_position(self, *,
+                                              base: str,
+                                              short_ex: str, short_sym: str,
+                                              long_ex: str, long_sym: str,
+                                              amount: float,
+                                              short_price: float, long_price: float,
+                                              short_rate: float, long_rate: float,
+                                              rate_spread: float, net_rate: float,
+                                              short_next_funding_time_ms: float,
+                                              long_next_funding_time_ms: float) -> bool:
+        """开仓跨交易所套利：并发下空单+多单，设置 cross_state。"""
         logger.info(
             "[跨交易所] 开仓 %s: %s空@%s(%.4f%%) + %s多@%s(%.4f%%) | 数量=%s | 费率差=%.4f%% | 净收益=%.4f%%",
-            base, base, short_ex, float(row["short_rate"]) * 100,
-            base, long_ex, float(row["long_rate"]) * 100,
-            amount, float(row["rate_spread"]) * 100, float(row["net_rate"]) * 100,
+            base, base, short_ex, short_rate * 100,
+            base, long_ex, long_rate * 100,
+            amount, rate_spread * 100, net_rate * 100,
         )
 
-        # 并发开两腿
         short_task = self._cross_open_short_leg(short_ex, short_sym, amount)
         long_task = self._cross_open_long_leg(long_ex, long_sym, amount)
         short_result, long_result = await asyncio.gather(short_task, long_task)
@@ -4464,23 +4431,23 @@ class FundingArbitrageBot:
                 long_order_id=str(long_result.order.get("id", "")),
                 short_entry_price=short_price,
                 long_entry_price=long_price,
-                short_rate=float(row["short_rate"]),
-                long_rate=float(row["long_rate"]),
-                rate_spread=float(row["rate_spread"]),
-                total_net_rate=float(row["net_rate"]),
+                short_rate=short_rate,
+                long_rate=long_rate,
+                rate_spread=rate_spread,
+                total_net_rate=net_rate,
                 opened_at=datetime.now(tz=self.tz).isoformat(),
-                short_next_funding_time_ms=float(row["short_next_funding_time_ms"]),
-                long_next_funding_time_ms=float(row["long_next_funding_time_ms"]),
+                short_next_funding_time_ms=short_next_funding_time_ms,
+                long_next_funding_time_ms=long_next_funding_time_ms,
             )
             self._save_cross_state()
             await asyncio.to_thread(
                 self._send_email,
                 "bazfbot 跨所开仓",
                 f"币种: {base}\n"
-                f"空 {short_ex}: {short_sym} 费率 {float(row['short_rate'])*100:.4f}%\n"
-                f"多 {long_ex}: {long_sym} 费率 {float(row['long_rate'])*100:.4f}%\n"
-                f"数量: {amount} | 费率差: {float(row['rate_spread'])*100:.4f}%\n"
-                f"净收益: {float(row['net_rate'])*100:.4f}%",
+                f"空 {short_ex}: {short_sym} 费率 {short_rate*100:.4f}%\n"
+                f"多 {long_ex}: {long_sym} 费率 {long_rate*100:.4f}%\n"
+                f"数量: {amount} | 费率差: {rate_spread*100:.4f}%\n"
+                f"净收益: {net_rate*100:.4f}%",
             )
             return True
 
@@ -4997,18 +4964,19 @@ class FundingArbitrageBot:
             await self._update_cross_dashboard(bn_bal, gt_bal)
             return
 
-        # ── 无持仓：狙击模式检查 → 查询余额 → 扫描 → 开仓 ──
-        # 如果上次扫描发现有候选快结算了，精准等到 T-5s 再扫+开
+        # ── 无持仓：狙击模式 ──
+        # T-5s 扫描获取最新费率 → T-250ms 直接开仓
         snipe_ms = getattr(self, "_next_snipe_settle_ms", 0)
         if snipe_ms:
             remain_ms = snipe_ms - time.time() * 1000
             if remain_ms <= 0:
                 self._next_snipe_settle_ms = 0
             elif remain_ms <= CROSS_SNIPE_WINDOW_SEC * 1000:
-                await asyncio.sleep(max(0, (remain_ms - CROSS_SNIPER_OFFSET_SEC * 1000) / 1000))
-                logger.info("[跨交易所] 狙击模式：距结算 %dms，立刻扫描+开仓",
+                # Step 1: sleep 到 T-5s，扫描
+                scan_at_ms = snipe_ms - CROSS_SNIPER_SCAN_OFFSET_SEC * 1000
+                await asyncio.sleep(max(0, (scan_at_ms - time.time() * 1000) / 1000))
+                logger.info("[跨交易所] 狙击扫描：距结算 %dms",
                              max(0, int(snipe_ms - time.time() * 1000)))
-                # 查余额算仓位
                 bn_bal, gt_bal = await asyncio.gather(
                     self._cross_get_bn_futures_balance(),
                     self._gate_futures_balance(),
@@ -5021,19 +4989,81 @@ class FundingArbitrageBot:
                 cross_df = await self._scan_cross_exchange(position_usdt, strict=True)
                 self._dash_cross_df = cross_df
                 passing = cross_df[cross_df["passes"] == True] if not cross_df.empty and "passes" in cross_df.columns else cross_df
-                if not cross_df.empty and not passing.empty:
-                    candidate = passing.iloc[0]
-                    logger.info("[跨交易所] 狙击开仓 %s: 费率差=%.4f%% 净收益=%.4f%%",
-                                 str(candidate["base"]), float(candidate["rate_spread"]) * 100,
-                                 float(candidate["net_rate"]) * 100)
-                    ok = await self._open_cross_exchange_position(candidate)
-                    if ok:
-                        settle_ms = min(float(candidate["short_next_funding_time_ms"]),
-                                        float(candidate["long_next_funding_time_ms"]))
-                        wait_ms = settle_ms + 2000 - time.time() * 1000
-                        if wait_ms > 0:
-                            await asyncio.sleep(wait_ms / 1000)
-                        await self._close_cross_exchange_position()
+                if passing.empty:
+                    logger.info("[跨交易所] 狙击扫描无合格候选，放弃")
+                    self._next_snipe_settle_ms = 0
+                    await self._update_cross_dashboard(bn_bal, gt_bal)
+                    return
+                candidate = passing.iloc[0]
+                logger.info("[跨交易所] 狙击目标 %s: 费率差=%.4f%% 净收益=%.4f%%",
+                             str(candidate["base"]),
+                             float(candidate["rate_spread"]) * 100,
+                             float(candidate["net_rate"]) * 100)
+
+                # ── 计算开仓参数（余额/价格/数量全在这算好，开仓函数只管下单）──
+                c_base = str(candidate["base"])
+                c_short_ex = str(candidate["short_exchange"])
+                c_long_ex = str(candidate["long_exchange"])
+                c_short_sym = str(candidate["short_symbol"])
+                c_long_sym = str(candidate["long_symbol"])
+                c_short_price = float(candidate["short_price"])
+                c_long_price = float(candidate["long_price"])
+                if c_short_price <= 0 or c_long_price <= 0:
+                    logger.error("[跨交易所] 狙击价格为零: short=%.6f long=%.6f (ticker数据缺失)", c_short_price, c_long_price)
+                    self._next_snipe_settle_ms = 0
+                    return
+                c_short_rate = float(candidate["short_rate"])
+                c_long_rate = float(candidate["long_rate"])
+                c_rate_spread = float(candidate["rate_spread"])
+                c_net_rate = float(candidate["net_rate"])
+                c_short_nft = float(candidate["short_next_funding_time_ms"])
+                c_long_nft = float(candidate["long_next_funding_time_ms"])
+
+                c_short_bal = bn_bal if c_short_ex == "binance" else gt_bal
+                c_long_bal = bn_bal if c_long_ex == "binance" else gt_bal
+                c_short_notional = c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
+                c_long_notional = c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
+                c_short_qty = await self._cross_calculate_amount(c_short_ex, c_short_sym, c_short_price, c_short_notional)
+                c_long_qty = await self._cross_calculate_amount(c_long_ex, c_long_sym, c_long_price, c_long_notional)
+                if c_short_qty <= 0 or c_long_qty <= 0:
+                    logger.error("[跨交易所] 狙击数量计算失败")
+                    self._next_snipe_settle_ms = 0
+                    return
+                c_amount = min(c_short_qty, c_long_qty)
+                est_short = c_amount * c_short_price
+                est_long = c_amount * c_long_price
+                if est_short > c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1 or \
+                   est_long > c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1:
+                    logger.error("[跨交易所] 狙击数量超限: short≈%.2f long≈%.2f", est_short, est_long)
+                    self._next_snipe_settle_ms = 0
+                    return
+                if est_short < 5.5 or est_long < 5.5:
+                    logger.warning("[跨交易所] 狙击仓位太小: short≈%.2f long≈%.2f USDT，跳过", est_short, est_long)
+                    self._next_snipe_settle_ms = 0
+                    return
+
+                # Step 2: sleep 到 T-250ms，开仓
+                open_at_ms = snipe_ms - CROSS_SNIPER_OPEN_OFFSET_MS
+                await asyncio.sleep(max(0, (open_at_ms - time.time() * 1000) / 1000))
+                logger.info("[跨交易所] 狙击开仓 %s: 距结算 %dms",
+                             c_base, max(0, int(snipe_ms - time.time() * 1000)))
+                ok = await self._open_cross_exchange_position(
+                    base=c_base,
+                    short_ex=c_short_ex, short_sym=c_short_sym,
+                    long_ex=c_long_ex, long_sym=c_long_sym,
+                    amount=c_amount,
+                    short_price=c_short_price, long_price=c_long_price,
+                    short_rate=c_short_rate, long_rate=c_long_rate,
+                    rate_spread=c_rate_spread, net_rate=c_net_rate,
+                    short_next_funding_time_ms=c_short_nft,
+                    long_next_funding_time_ms=c_long_nft,
+                )
+                if ok:
+                    settle_ms = max(c_short_nft, c_long_nft)
+                    wait_ms = settle_ms - time.time() * 1000
+                    if wait_ms > 0:
+                        await asyncio.sleep(wait_ms / 1000)
+                    await self._close_cross_exchange_position()
                 self._next_snipe_settle_ms = 0
                 await self._update_cross_dashboard(bn_bal, gt_bal)
                 return
@@ -5066,15 +5096,20 @@ class FundingArbitrageBot:
             self._dash_cross_df = cross_df
             if cross_df.empty:
                 logger.info("[跨交易所] 两所无共同币种，无法扫描。")
+                self._next_snipe_settle_ms = 0
                 return
 
-        # 更新下次狙击结算时间
+        # 更新下次狙击结算时间（只取 passes=True 中费率差最高的）
         if not cross_df.empty:
-            best = cross_df.iloc[0]
-            self._next_snipe_settle_ms = min(
-                float(best.get("short_next_funding_time_ms", 0)),
-                float(best.get("long_next_funding_time_ms", 0)),
-            )
+            passing = cross_df[cross_df["passes"] == True] if "passes" in cross_df.columns else cross_df
+            if not passing.empty:
+                best = passing.iloc[0]
+                self._next_snipe_settle_ms = min(
+                    float(best.get("short_next_funding_time_ms", 0)),
+                    float(best.get("long_next_funding_time_ms", 0)),
+                )
+            else:
+                self._next_snipe_settle_ms = 0
 
         self._print_cross_opportunity_table(cross_df, position_usdt)
 
