@@ -103,7 +103,7 @@ FUTURES_LIQ_DISTANCE_MIN = 0.30  # 合约空单距强平最小距离30%，币价
 # 流动性过滤不宜过严，否则会错过资金费率机会。
 # 默认 hybrid: 合约侧至少 1500 万 USDT，现货侧至少 100 万 USDT。
 LIQUIDITY_MODE = "hybrid"  # options: futures_only, both_legs, hybrid
-MIN_FUTURES_24H_QUOTE_VOLUME = 15_000_000
+MIN_FUTURES_24H_QUOTE_VOLUME = 5_000_000
 MIN_SPOT_24H_QUOTE_VOLUME = 1_000_000
 
 # 扫描/开仓: 无持仓时每隔 SCAN_INTERVAL_MINUTES 分钟全市场扫描。
@@ -1670,14 +1670,18 @@ class FundingArbitrageBot:
         if not CROSS_EXCHANGE_ENABLED:
             return pd.DataFrame()
 
-        # 并行获取两所费率 + 手续费
-        bn_fee_pair, gt_fee_pair, bn_funding, gt_funding = await asyncio.gather(
+        # 并行获取两所费率 + 手续费 + 全量ticker（用于价格校验）
+        bn_fee_pair, gt_fee_pair, bn_funding, gt_funding, bn_tickers, gt_tickers = await asyncio.gather(
             self.fetch_taker_fees(),
             self._fetch_gate_taker_fees(),
             self._safe_request("futures.fetch_funding_rates",
                                lambda: self.futures.fetch_funding_rates(), default={}),
             self._safe_request("gate_futures.fetch_funding_rates",
                                lambda: self.gate_futures.fetch_funding_rates(), default={}),
+            self._safe_request("futures.fetch_tickers",
+                               lambda: self.futures.fetch_tickers(), default={}),
+            self._safe_request("gate_futures.fetch_tickers",
+                               lambda: self.gate_futures.fetch_tickers(), default={}),
         )
         _, bn_futures_fee_dict = bn_fee_pair
         _, gt_futures_fee_dict = gt_fee_pair
@@ -1713,15 +1717,37 @@ class FundingArbitrageBot:
         bn_rates = _parse_rates(bn_funding, bn_market_index, "binance")
         gt_rates = _parse_rates(gt_funding, gt_market_index, "gate")
 
-        # 找共同币种
-        common = set(bn_rates.keys()) & set(gt_rates.keys())
-        if not common:
+        # ── 找共同币种：同名 + 价格校验 ──
+        # 两所同名且价差 <1% 才视为同一资产，否则跳过
+        PRICE_DIVERGENCE_THRESHOLD = 0.01
+
+        def _ticker_price(tickers: dict, symbol: str) -> float:
+            t = tickers.get(symbol, {})
+            return float(t.get("last") or 0)
+
+        valid_pairs: dict[str, str] = {}  # bn_base → gt_base
+
+        for base in set(bn_rates) & set(gt_rates):
+            bn_sym = bn_rates[base][0]
+            gt_sym = gt_rates[base][0]
+            bp = _ticker_price(bn_tickers, bn_sym)
+            gp = _ticker_price(gt_tickers, gt_sym)
+            if bp > 0 and gp > 0 and abs(bp - gp) / min(bp, gp) >= PRICE_DIVERGENCE_THRESHOLD:
+                logger.debug("[跨交易所] 价格拒绝 %s: BN=%.6f GT=%.6f 偏离=%.1f%%",
+                           base, bp, gp, abs(bp - gp) / min(bp, gp) * 100)
+                continue
+            valid_pairs[base] = base
+
+
+        if not valid_pairs:
             return pd.DataFrame()
 
         rows: list[dict[str, Any]] = []
-        for base in common:
-            bn_sym, bn_rate, bn_nft = bn_rates[base]
-            gt_sym, gt_rate, gt_nft = gt_rates[base]
+        for bn_base, gt_base in valid_pairs.items():
+            if bn_base not in bn_rates or gt_base not in gt_rates:
+                continue
+            bn_sym, bn_rate, bn_nft = bn_rates[bn_base]
+            gt_sym, gt_rate, gt_nft = gt_rates[gt_base]
 
             rate_spread = abs(bn_rate - gt_rate)
             if strict and rate_spread < CROSS_MIN_RATE_SPREAD:
@@ -1759,8 +1785,11 @@ class FundingArbitrageBot:
             if strict and not passes:
                 continue
 
+            bn_price = float((bn_tickers.get(bn_sym) or {}).get("last") or 0)
+            gt_price = float((gt_tickers.get(gt_sym) or {}).get("last") or 0)
+
             rows.append({
-                "base": base,
+                "base": bn_base,
                 "rate_spread": rate_spread,
                 "net_rate": net_rate,
                 "short_exchange": short_ex,
@@ -1773,6 +1802,8 @@ class FundingArbitrageBot:
                 "long_fee": long_fee,
                 "short_next_funding_time_ms": short_nft,
                 "long_next_funding_time_ms": long_nft,
+                "bn_price": bn_price,
+                "gt_price": gt_price,
                 "passes": passes,
             })
 
@@ -4682,20 +4713,22 @@ class FundingArbitrageBot:
         est_profit = position_usdt * POSITION_SIZE_RATIO
         has_col = "passes" in df.columns
         lines = []
-        lines.append(f"  ═══════════════════════════════════════════════════════════════════════════════")
+        lines.append(f"  ═══════════════════════════════════════════════════════════════════════════════════════════")
         lines.append(f"  跨交易所资金费率套利 (纯期货多空对冲)  —  每腿 ≈{est_profit:.0f} USDT")
-        lines.append(f"  ═══════════════════════════════════════════════════════════════════════════════")
-        header = (f"  {'币种':<8s} {'费率差':>7s} {'净收益':>7s} "
+        lines.append(f"  ═══════════════════════════════════════════════════════════════════════════════════════════")
+        header = (f"  {'币种':<8s} {'BN价':>10s} {'GT价':>10s} {'费率差':>7s} {'净收益':>7s} "
                   f"{'做空所':>6s} {'空费率':>7s} {'空结算':>7s} "
                   f"{'做多所':>6s} {'多费率':>7s} {'多结算':>7s}")
         lines.append(header)
-        lines.append("  " + "-" * 94)
+        lines.append("  " + "-" * 110)
         now_ms = time.time() * 1000
         for _, r in df.head(20).iterrows():
             if has_col:
                 mark = "✓" if r.get("passes", False) else "✗"
             else:
                 mark = " "
+            bn_p = float(r.get("bn_price", 0))
+            gt_p = float(r.get("gt_price", 0))
             short_nft = float(r.get("short_next_funding_time_ms", 0))
             long_nft = float(r.get("long_next_funding_time_ms", 0))
             short_m = max(0, (short_nft - now_ms) / 60000) if short_nft > 0 else -1
@@ -4703,7 +4736,7 @@ class FundingArbitrageBot:
             short_wait = f"{int(short_m)}m" if short_m >= 0 else "N/A"
             long_wait = f"{int(long_m)}m" if long_m >= 0 else "N/A"
             lines.append(
-                f"  {mark}{str(r['base']):<8s} {float(r['rate_spread'])*100:>6.4f}% {float(r['net_rate'])*100:>6.4f}% "
+                f"  {mark}{str(r['base']):<8s} {bn_p:>10.6f} {gt_p:>10.6f} {float(r['rate_spread'])*100:>6.4f}% {float(r['net_rate'])*100:>6.4f}% "
                 f"{str(r['short_exchange']):>6s} {float(r['short_rate'])*100:>7.4f}% {short_wait:>7s} "
                 f"{str(r['long_exchange']):>6s} {float(r['long_rate'])*100:>7.4f}% {long_wait:>7s}"
             )
@@ -5015,25 +5048,6 @@ class FundingArbitrageBot:
             )
 
         self._print_cross_opportunity_table(cross_df, position_usdt)
-
-        # 仅尝试开仓通过严格筛选的候选
-        passing = cross_df[cross_df["passes"] == True] if "passes" in cross_df.columns else cross_df
-        if passing.empty:
-            logger.info("[跨交易所] 无符合严格条件的候选（费率差/净收益/结算窗口均未达标）。")
-            return
-
-        for _, candidate in passing.head(1).iterrows():
-            logger.info("[跨交易所] 尝试开仓 %s: 费率差=%.4f%% 净收益=%.4f%% | 空@%s(%.4f%%) 多@%s(%.4f%%)",
-                         str(candidate["base"]), float(candidate["rate_spread"]) * 100,
-                         float(candidate["net_rate"]) * 100,
-                         str(candidate["short_exchange"]), float(candidate["short_rate"]) * 100,
-                         str(candidate["long_exchange"]), float(candidate["long_rate"]) * 100)
-            ok = await self._open_cross_exchange_position(candidate)
-            if ok:
-                return
-            logger.warning("[跨交易所] 开仓 %s 失败，尝试下一个候选。", candidate["base"])
-
-        logger.info("[跨交易所] 所有候选均开仓失败。")
 
     async def _update_cross_dashboard(self, bn_fut_bal: float, gt_fut_bal: float) -> None:
         """在跨所模式下填充看板余额变量。"""
@@ -6074,11 +6088,15 @@ class FundingArbitrageBot:
                     held = held or (str(row["base"]) == self.gate_state.base
                                    and direction == self.gate_state.direction)
                 held_mark = " ★" if held else ""
+                spot_p = float(row.get("spot_last", 0) or 0)
+                fut_p = float(row.get("futures_last", 0) or 0)
                 rows_html += f"""
                 <tr class="{'held' if held else ''}">
                     <td><span class="badge {exc_cls}">{exchange}</span></td>
                     <td><span class="badge {dir_cls}">{dir_label}</span></td>
                     <td>{str(row['base'])[:8]}{held_mark}</td>
+                    <td class="right">{spot_p:.6f}</td>
+                    <td class="right">{fut_p:.6f}</td>
                     <td class="right">{float(row['predicted_funding_rate'])*100:+.3f}%</td>
                     <td class="right">{float(row['spot_taker_fee'])*100:.3f}%</td>
                     <td class="right">{float(row['futures_taker_fee'])*100:.3f}%</td>
@@ -6087,7 +6105,7 @@ class FundingArbitrageBot:
                     <td class="right">{countdown}</td>
                 </tr>"""
         else:
-            rows_html = '<tr><td colspan="9" class="muted center">暂无套利机会</td></tr>'
+            rows_html = '<tr><td colspan="11" class="muted center">暂无套利机会</td></tr>'
 
         table_html = f"""
         <div class="section">
@@ -6096,7 +6114,7 @@ class FundingArbitrageBot:
             <table>
                 <thead>
                     <tr>
-                        <th>所</th><th>方向</th><th>币种</th>
+                        <th>所</th><th>方向</th><th>币种</th><th class="right">现货价</th><th class="right">合约价</th>
                         <th class="right">费率</th><th class="right">现货费</th><th class="right">合约费</th>
                         <th class="right">借币费</th><th class="right">净收益</th><th class="right">结算</th>
                     </tr>
@@ -6129,10 +6147,14 @@ class FundingArbitrageBot:
                 held_mark = " ★" if held else ""
                 pass_mark = "✓" if passes else "✗"
                 pass_cls = "pass" if passes else "fail"
+                bn_p = float(row.get("bn_price", 0))
+                gt_p = float(row.get("gt_price", 0))
                 cross_rows_html += f"""
                 <tr class="{'held' if held else ''}">
                     <td><span class="{pass_cls}">{pass_mark}</span></td>
                     <td>{str(row['base'])[:8]}{held_mark}</td>
+                    <td class="right">{bn_p:.6f}</td>
+                    <td class="right">{gt_p:.6f}</td>
                     <td class="right">{rate_spread*100:+.4f}%</td>
                     <td class="right {net_cls}">{net_rate*100:+.4f}%</td>
                     <td><span class="badge bn">{short_ex.upper()}</span></td>
@@ -6143,7 +6165,7 @@ class FundingArbitrageBot:
                     <td class="right">{l_countdown}</td>
                 </tr>"""
         else:
-            cross_rows_html = '<tr><td colspan="10" class="muted center">暂无跨所套利机会</td></tr>'
+            cross_rows_html = '<tr><td colspan="12" class="muted center">暂无跨所套利机会</td></tr>'
 
         cross_table_html = f"""
         <div class="section">
@@ -6152,7 +6174,7 @@ class FundingArbitrageBot:
             <table>
                 <thead>
                     <tr>
-                        <th>通过</th><th>币种</th><th class="right">费率差</th><th class="right">净收益</th>
+                        <th>通过</th><th>币种</th><th class="right">BN价</th><th class="right">GT价</th><th class="right">费率差</th><th class="right">净收益</th>
                         <th>做空所</th><th class="right">空费率</th><th class="right">空结算</th>
                         <th>做多所</th><th class="right">多费率</th><th class="right">多结算</th>
                     </tr>
@@ -6202,7 +6224,7 @@ h2 {{ font-size: 0.95rem; margin-bottom: 8px; color: #aaa; }}
 .badge.forward {{ background: #4090e0; color: #fff; }}
 .badge.cross {{ background: #a855f7; color: #fff; }}
 .badge.bn {{ background: #f0b90b; color: #111; }}
-.badge.gt {{ background: #17c9a4; color: #111; }}
+.badge.gt {{ background: #2955E7; color: #fff; }}
 .pass {{ color: #0ecb81; font-weight: bold; }}
 .fail {{ color: #e74c3c; }}
 .table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
@@ -6343,11 +6365,11 @@ def _print_opportunity_table(df: pd.DataFrame, ref_usdt: float, direction: str =
             f"  共 {len(df)} 个机会, 显示 Top 20 | 利润按每 {ref_usdt:.0f} USDT/腿 参考值"
         )
         col_header = (
-            f"  {'排名':<4} {'币种':<10} {'来源':<6} {'链':<8} "
+            f"  {'排名':<4} {'币种':<10} {'现货价':>10} {'合约价':>10} {'来源':<6} {'链':<8} "
             f"{'费率':>8} {'现货费':>8} {'合约费':>8} {'借币费':>8} {'净收益':>8} {'利润(USDT)':>10}"
         )
         row_fmt = (
-            "  {rank:<4} {base:<10} {source:<6} {chain:<8} "
+            "  {rank:<4} {base:<10} {spot_p:>10.6f} {fut_p:>10.6f} {source:<6} {chain:<8} "
             "{rate:>7.3f}% {spot_fee:>7.3f}% {fut_fee:>7.3f}% {borrow:>7.3f}% "
             "{net:>7.3f}% {profit:>9.4f}"
         )
@@ -6357,20 +6379,20 @@ def _print_opportunity_table(df: pd.DataFrame, ref_usdt: float, direction: str =
             f"  共 {len(df)} 个机会, 显示 Top 20 | 利润按每 {ref_usdt:.0f} USDT/腿 参考值"
         )
         col_header = (
-            f"  {'排名':<4} {'币种':<10} {'来源':<6} {'链':<12} "
+            f"  {'排名':<4} {'币种':<10} {'现货价':>10} {'合约价':>10} {'来源':<6} {'链':<12} "
             f"{'费率':>8} {'现货费':>8} {'合约费':>8} {'净收益':>8} {'利润(USDT)':>10}"
         )
         row_fmt = (
-            "  {rank:<4} {base:<10} {source:<6} {chain:<12} "
+            "  {rank:<4} {base:<10} {spot_p:>10.6f} {fut_p:>10.6f} {source:<6} {chain:<12} "
             "{rate:>7.3f}% {spot_fee:>7.3f}% {fut_fee:>7.3f}% "
             "{net:>7.3f}% {profit:>9.4f}"
         )
 
-    print(f"\n{'='*90}")
+    print(f"\n{'='*110}")
     print(header)
-    print(f"{'='*90}")
+    print(f"{'='*110}")
     print(col_header)
-    print(f"  {'-'*88}")
+    print(f"  {'-'*108}")
 
     for rank, (_, row) in enumerate(top20.iterrows(), 1):
         kwargs = dict(
@@ -6378,6 +6400,8 @@ def _print_opportunity_table(df: pd.DataFrame, ref_usdt: float, direction: str =
             base=str(row["base"])[:10],
             source=str(row["spot_source"])[:6],
             chain=str(row.get("chain", ""))[:12] if direction == "positive" else str(row.get("chain", ""))[:8],
+            spot_p=float(row.get("spot_last", 0) or 0),
+            fut_p=float(row.get("futures_last", 0) or 0),
             rate=float(row["predicted_funding_rate"]) * 100,
             spot_fee=float(row["spot_taker_fee"]) * 100,
             fut_fee=float(row["futures_taker_fee"]) * 100,

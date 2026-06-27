@@ -17,5 +17,5 @@ NOTIFY_EMAIL_AUTH = "QQ邮箱SMTP授权码"
 # 跨交易所资金费率差异套利：--cross 启动
 # 单交易所套利（BN/GT 独立）：不加 --cross 即可（默认模式）
 # 用法示例：
-#   python funding_arbitrage_bot.py --cross --scan   # 查看跨所机会
-#   python funding_arbitrage_bot.py --cross --live    # 跨所实盘
+#   python -m funding_arbitrage_bot.main --cross --scan   # 查看跨所机会
+#   python -m funding_arbitrage_bot.main --cross --live    # 跨所实盘
