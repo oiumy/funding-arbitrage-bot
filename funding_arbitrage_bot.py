@@ -51,6 +51,7 @@ if _has_proxy:
 else:
     HTTP_PROXY = None  # 服务器直连
 
+import aiohttp
 import ccxt.async_support as ccxt_async
 import pandas as pd
 from ccxt import BaseError, ExchangeError
@@ -178,7 +179,7 @@ CROSS_EXCHANGE_ENABLED = True            # 跨所套利开关（默认开，--cr
 CROSS_SHOW_SINGLE = True                # 跨所模式下同时展示单交易所套利机会（仅扫描，不下单）
 CROSS_POSITION_SIZE_RATIO = 0.98        # 跨所资金利用率（纯期货对冲，价格风险中性，可更高）
 CROSS_SNIPER_SCAN_OFFSET_SEC = 10         # 结算前N秒扫描（获取最新费率）
-CROSS_SNIPER_OPEN_OFFSET_MS = 1000         # 结算前N毫秒发出开仓（从容下单）
+CROSS_SNIPER_OPEN_OFFSET_MS = 1000         # 结算前N毫秒发出开仓（预留足够网络延迟）
 CROSS_LEVERAGE = 1                        # 跨所套利用的合约杠杆倍数
 CROSS_SNIPE_WINDOW_SEC = 60              # 距结算≤N秒时跳过单所扫描，直接狙击
 CROSS_MIN_RATE_SPREAD = 0.0003          # 最小原始费率差 0.03%
@@ -259,7 +260,10 @@ class CrossArbitrageState:
 
     is_open: bool = False
     base: str | None = None
-    amount: float = 0.0
+    amount: float = 0.0            # 名义金额（向后兼容显示用）
+
+    short_amount: float = 0.0      # 空单实际下单张数（不同交易所 contractSize 不同）
+    long_amount: float = 0.0       # 多单实际下单张数
 
     short_exchange: str = "binance"  # 做空交易所（费率更高）
     long_exchange: str = "gate"      # 做多交易所（费率更低）
@@ -310,6 +314,24 @@ class FundingArbitrageBot:
         self._gate_margin_bases_ts: float = 0.0
         self._leverage_set: set[tuple[str, str, int]] = set()  # 已设杠杆缓存 (exchange, symbol, leverage)
         self._fee_lock = asyncio.Lock()
+        self._bn_listen_key: str | None = None
+        self._bn_listen_key_ts: float = 0.0
+        self._funding_event = asyncio.Event()
+        self._funding_session: aiohttp.ClientSession | None = None
+        self._funding_ws: Any = None
+        self._gate_funding_event = asyncio.Event()
+        self._gate_funding_ws: Any = None
+        self._gate_funding_session: aiohttp.ClientSession | None = None
+        self._gate_funding_symbol: str = ""
+        self._gate_funding_baseline: float = 0.0
+        self._gate_funding_amount: float = 0.0  # WS 检测到的实际资费
+        # BN + Gate 交易 WS（持久连接，下单省 HTTP 握手 + to_thread 开销）
+        self._bn_trade_ws: Any = None
+        self._bn_trade_session: aiohttp.ClientSession | None = None
+        self._bn_trade_futures: dict[str, asyncio.Future] = {}
+        self._gate_trade_ws: Any = None
+        self._gate_trade_session: aiohttp.ClientSession | None = None
+        self._gate_trade_futures: dict[str, asyncio.Future] = {}
 
     @staticmethod
     def _ccxt_config(options: dict | None = None) -> dict[str, Any]:
@@ -318,6 +340,7 @@ class FundingArbitrageBot:
             "apiKey": BINANCE_API_KEY,
             "secret": BINANCE_API_SECRET,
             "enableRateLimit": True,
+            "timeout": 30000,  # 30s, ccxt 默认 10s 有时不够
         }
         if HTTP_PROXY:
             cfg["aiohttp_proxy"] = HTTP_PROXY
@@ -367,6 +390,7 @@ class FundingArbitrageBot:
             "apiKey": GATE_API_KEY,
             "secret": GATE_API_SECRET,
             "enableRateLimit": True,
+            "timeout": 60000,
         }
         if HTTP_PROXY:
             cfg["aiohttp_proxy"] = HTTP_PROXY
@@ -472,22 +496,38 @@ class FundingArbitrageBot:
                 raise
             return default
         except BaseError as exc:
-            logger.error("ccxt 请求错误: %s | %s", name, exc)
+            logger.error("ccxt 请求错误: %s | %s: %s", name, type(exc).__name__, exc)
             if raise_error:
                 raise
             return default
 
     async def initialize(self) -> None:
-        """加载市场元数据。amount_to_precision 依赖该数据。"""
-        await asyncio.gather(
-            self._safe_request("spot.load_markets", lambda: self.spot.load_markets(), raise_error=True),
-            self._safe_request("futures.load_markets", lambda: self.futures.load_markets(), raise_error=True),
-            self._safe_request("gate_spot.load_markets", lambda: self.gate_spot.load_markets(), raise_error=False),
-            self._safe_request("gate_futures.load_markets", lambda: self.gate_futures.load_markets(), raise_error=False),
-        )
+        """加载市场元数据，建立资费监听 WS 长连接。"""
+        # 全部交易所 load_markets 加重试（VPS 时钟偏差/网络抖动可导致 InvalidNonce/超时）
+        for name, ex, fatal in [("spot", self.spot, True), ("futures", self.futures, True),
+                                ("gate_spot", self.gate_spot, False), ("gate_futures", self.gate_futures, False)]:
+            for attempt in range(3):
+                try:
+                    await asyncio.wait_for(ex.load_markets(), timeout=30)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        logger.warning("[初始化] %s load_markets 失败 (attempt %d/3): %s，3s 后重试...", name, attempt + 1, e)
+                        await asyncio.sleep(3)
+                    elif fatal:
+                        raise
+                    else:
+                        logger.error("[初始化] %s load_markets 3 次均失败: %s", name, e)
+        # 建立资费监听 + 交易 WS 长连接（Gate 资费监听复用交易 WS，不再单开连接）
+        if CROSS_EXCHANGE_ENABLED:
+            await asyncio.gather(
+                self._ensure_bn_funding_ws(),
+                self._ensure_bn_trade_ws(),
+                self._ensure_gate_trade_ws(),
+            )
 
     async def close(self) -> None:
-        """关闭 ccxt 异步会话与 REST 连接池。"""
+        """关闭 ccxt 异步会话、REST 连接池、WS 长连接。"""
         self._rest_session.close()
         await asyncio.gather(
             self._safe_request("spot.close", lambda: self.spot.close()),
@@ -495,6 +535,23 @@ class FundingArbitrageBot:
             self._safe_request("gate_spot.close", lambda: self.gate_spot.close()),
             self._safe_request("gate_futures.close", lambda: self.gate_futures.close()),
         )
+        await self._close_bn_funding_ws()
+        await self._close_bn_trade_ws()
+        await self._close_gate_trade_ws()
+        # 清理 aiohttp session
+        for attr in ("_funding_session", "_gate_funding_session",
+                      "_bn_trade_session", "_gate_trade_session"):
+            sess = getattr(self, attr, None)
+            if sess:
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
+        # 取消所有等待中的 WS 订单 futures
+        for fut_dict_attr in ("_bn_trade_futures", "_gate_trade_futures"):
+            for fut in getattr(self, fut_dict_attr, {}).values():
+                if not fut.done():
+                    fut.set_exception(Exception("bot shutting down"))
 
     @staticmethod
     def _load_state(exchange: str = "binance") -> ArbitrageState:
@@ -682,6 +739,201 @@ class FundingArbitrageBot:
                 logger.error("Binance API 请求失败: %s %s — %s", method, path, exc)
             raise
 
+    async def _gate_request(
+        self, path: str, body: dict | None = None, method: str = "GET",
+        timeout: int = 15, params: dict | None = None,
+    ) -> dict[str, Any]:
+        """向 Gate.io 官方 REST API 发签名请求，返回 JSON。
+        Gate v4 签名：HMAC-SHA512(METHOD\nPATH\n\nBODY_SHA512\nTIMESTAMP)
+        params 仅拼接到 URL（不参与签名），用于 leverage 等 query-string 参数。
+        """
+        from urllib.parse import urlencode
+        ts = str(int(time.time()))
+        body_str = json.dumps(body, separators=(",", ":")) if body else ""
+        body_hash = hashlib.sha512(body_str.encode()).hexdigest()
+        sign_path = f"/api/v4{path}"
+        qs = urlencode(params) if params else ""
+        message = f"{method}\n{sign_path}\n{qs}\n{body_hash}\n{ts}"
+        sign = hmac.new(
+            GATE_API_SECRET.encode(), message.encode(), hashlib.sha512,
+        ).hexdigest()
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "KEY": GATE_API_KEY,
+            "SIGN": sign,
+            "Timestamp": ts,
+        }
+        url = f"{GATE_FUTURES_API}{path}"
+        if params:
+            url += "?" + urlencode(params)
+
+        def _do() -> dict[str, Any]:
+            resp = self._rest_session.request(
+                method, url, headers=headers, data=body_str or None, timeout=timeout,
+            )
+            data = resp.json()
+            if not resp.ok:
+                raise Exception(f"HTTP {resp.status_code}: {data}")
+            return data  # type: ignore[no-any-return]
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as exc:
+            msg = str(exc)
+            if "HTTP 4" in msg:
+                logger.warning("Gate 业务拒绝: %s %s — %s", method, path, exc)
+            else:
+                logger.error("Gate API 请求失败: %s %s — %s", method, path, exc)
+            raise
+
+    @staticmethod
+    def _to_gate_contract(symbol: str) -> str:
+        """BTC/USDT:USDT → BTC_USDT"""
+        parts = symbol.split("/")
+        base = parts[0]
+        quote = parts[1].split(":")[0] if len(parts) > 1 else "USDT"
+        return f"{base}_{quote}"
+
+    async def _fetch_gate_funding_rates_direct(self,
+            tickers: dict[str, Any] | None = None) -> dict[str, Any]:
+        """从 Gate tickers 提取资金费率（轻量，不复用重端点 contracts）。
+        tickers 含 funding_rate + funding_rate_indicative，比 /contracts 快 10x+。
+        可传入预拉取的 tickers 避免重复请求。"""
+        if tickers is None:
+            tickers = await self._fetch_gate_futures_tickers_direct()
+        if not tickers:
+            return {}
+        now_s = int(time.time())
+        next_settle_ms = (((now_s // 28800) + 1) * 28800) * 1000  # Gate 8h 结算点
+        result = {}
+        for symbol, t in tickers.items():
+            info = t.get("info", {}) if isinstance(t, dict) else {}
+            rate = float((info.get("funding_rate", 0) or 0))
+            indicative = float((info.get("funding_rate_indicative", 0) or 0))
+            result[symbol] = {
+                "info": info,
+                "fundingRate": indicative if indicative != 0 else rate,
+                "nextFundingRate": indicative,
+                "nextFundingTime": next_settle_ms,
+            }
+        return result
+
+    async def _fetch_gate_futures_tickers_direct(self) -> dict[str, Any]:
+        """直连 Gate REST 获取全市场合约行情，返回 ccxt 兼容格式（带 5s 缓存）。"""
+        now = time.time()
+        cache = getattr(self, "_gate_ft_cache", {})
+        if cache and (now - cache.get("ts", 0)) < 5:
+            return cache["data"]
+        try:
+            tickers = await self._gate_request("/futures/usdt/tickers?timezone=utc0", timeout=30)
+        except Exception:
+            return {}
+        result = {}
+        for t in (tickers if isinstance(tickers, list) else []):
+            contract = t.get("contract", "")
+            if not contract.endswith("_USDT"):
+                continue
+            base = contract.replace("_USDT", "")
+            symbol = f"{base}/USDT:USDT"
+            result[symbol] = {
+                "symbol": symbol,
+                "last": float(t.get("last", 0) or 0),
+                "info": t,
+            }
+        self._gate_ft_cache = {"ts": now, "data": result}
+        return result
+
+    async def _fetch_gate_spot_tickers_direct(self) -> dict[str, Any]:
+        """直连 Gate REST 获取全市场现货行情，返回 ccxt 兼容格式。"""
+        try:
+            tickers = await self._gate_request("/spot/tickers?timezone=utc0", timeout=30)
+        except Exception:
+            return {}
+        result = {}
+        for t in (tickers if isinstance(tickers, list) else []):
+            pair = t.get("currency_pair", "")
+            if not pair.endswith("_USDT"):
+                continue
+            base = pair.replace("_USDT", "")
+            symbol = f"{base}/USDT"
+            result[symbol] = {
+                "symbol": symbol,
+                "last": float(t.get("last", 0) or 0),
+                "info": t,
+            }
+        return result
+
+    async def _fetch_gate_positions_direct(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """直连 Gate REST 获取合约持仓，返回 ccxt 兼容格式。"""
+        contract = self._to_gate_contract(symbol) if symbol else None
+        path = f"/futures/usdt/positions/{contract}" if contract else "/futures/usdt/positions"
+        try:
+            positions = await self._gate_request(path, timeout=10)
+        except Exception:
+            return []
+        positions = positions if isinstance(positions, list) else [positions] if isinstance(positions, dict) else []
+        result = []
+        for p in positions:
+            name = p.get("contract", "")
+            if not name.endswith("_USDT"):
+                continue
+            base = name.replace("_USDT", "")
+            sym = f"{base}/USDT:USDT"
+            size = float(p.get("size", 0) or 0)
+            result.append({
+                "symbol": sym,
+                "contracts": abs(size),
+                "side": "long" if size > 0 else "short" if size < 0 else "",
+                "notional": abs(size) * float(p.get("mark_price", 0) or 0),
+                "info": p,
+            })
+        return result
+
+    async def _fetch_gate_unified_balance_direct(self) -> dict[str, Any]:
+        """直连 Gate REST 获取统一账户余额，返回 ccxt 兼容格式（含 free/total 嵌套）。"""
+        now = time.time()
+        cache = getattr(self, "_gate_balance_cache", {})
+        if cache and (now - cache.get("ts", 0)) < 10:
+            return cache["data"]
+        try:
+            acct = await self._gate_request("/unified/accounts", timeout=10)
+        except Exception as exc:
+            logger.warning("Gate 统一账户查询失败: %s", exc)
+            empty: dict[str, Any] = {"free": {}, "total": {}, "USDT": {"free": 0.0, "total": 0.0}}
+            return empty
+        balances = acct.get("balances", {}) if isinstance(acct, dict) else {}
+        total_equity = float(acct.get("total", 0) or 0)
+        free_dict: dict[str, float] = {}
+        total_dict: dict[str, float] = {}
+        result: dict[str, Any] = {"info": acct}
+        for currency, info in (balances.items() if isinstance(balances, dict) else []):
+            if not isinstance(info, dict):
+                continue
+            available = float((info.get("available", 0) or 0))
+            freeze = float((info.get("freeze", 0) or 0))
+            free_dict[currency] = available
+            total_dict[currency] = available + freeze
+            result[currency] = {"free": available, "total": available + freeze, "info": info}
+        if "USDT" not in result:
+            free_dict["USDT"] = total_equity
+            total_dict["USDT"] = total_equity
+            result["USDT"] = {"free": total_equity, "total": total_equity}
+        result["free"] = free_dict
+        result["total"] = total_dict
+        self._gate_balance_cache = {"ts": now, "data": result}
+        logger.info("Gate 统一账户: USDT可用=%.2f 总计=%.2f",
+                     free_dict.get("USDT", 0.0), total_dict.get("USDT", 0.0))
+        return result
+
+    async def _fetch_gate_futures_balance_direct(self) -> dict[str, Any]:
+        """统一账户：直接查 /unified/accounts。"""
+        return await self._fetch_gate_unified_balance_direct()
+
+    async def _fetch_gate_spot_balance_direct(self) -> dict[str, Any]:
+        """统一账户：直接查 /unified/accounts。"""
+        return await self._fetch_gate_unified_balance_direct()
+
     @staticmethod
     def _clean_spot_symbol(symbol: str) -> str:
         """BTC/USDT → BTCUSDT"""
@@ -704,8 +956,11 @@ class FundingArbitrageBot:
 
         市价单正常情况下应全部成交; 成交不足视为部分成交。
         """
-        filled = float(resp.get("executedQty", 0))
+        filled_raw = resp.get("executedQty", 0)
+        filled = float(filled_raw) if filled_raw else 0.0
         status = resp.get("status", "")
+        if status == "FILLED" and filled <= 0:
+            filled = amount  # WS 响应可能省略 executedQty，市价单默认全成交
         ok = status == "FILLED" and filled >= amount * 0.9
         return {
             "id": str(resp.get("orderId", "")),
@@ -1498,9 +1753,9 @@ class FundingArbitrageBot:
     async def _scan_gate_forward(self, position_usdt: float = 100.0) -> pd.DataFrame:
         """Gate.io 正向扫描：现货买入 + 合约做空。无 Alpha 回退。"""
         spot_tickers, futures_tickers, funding_rates, fee_pair = await asyncio.gather(
-            self._safe_request("gate_spot.fetch_tickers", lambda: self.gate_spot.fetch_tickers(), default={}),
-            self._safe_request("gate_futures.fetch_tickers", lambda: self.gate_futures.fetch_tickers(), default={}),
-            self._safe_request("gate_futures.fetch_funding_rates", lambda: self.gate_futures.fetch_funding_rates(), default={}),
+            self._fetch_gate_spot_tickers_direct(),
+            self._fetch_gate_futures_tickers_direct(),
+            self._fetch_gate_funding_rates_direct(),
             self._fetch_gate_taker_fees(),
         )
         spot_taker_fees, futures_taker_fees = fee_pair
@@ -1523,7 +1778,7 @@ class FundingArbitrageBot:
             next_ft = self._extract_next_funding_time(funding_item)
 
             spot_symbol = f"{base}/USDT"
-            spot_market = self.gate_spot.markets.get(spot_symbol)
+            spot_market = (getattr(self.gate_spot, "markets", None) or {}).get(spot_symbol)
             if not spot_market or not spot_market.get("active", True):
                 continue
             spot_ticker = spot_tickers.get(spot_symbol, {})
@@ -1576,9 +1831,9 @@ class FundingArbitrageBot:
             return pd.DataFrame()
 
         spot_tickers, futures_tickers, funding_rates, fee_pair = await asyncio.gather(
-            self._safe_request("gate_spot.fetch_tickers", lambda: self.gate_spot.fetch_tickers(), default={}),
-            self._safe_request("gate_futures.fetch_tickers", lambda: self.gate_futures.fetch_tickers(), default={}),
-            self._safe_request("gate_futures.fetch_funding_rates", lambda: self.gate_futures.fetch_funding_rates(), default={}),
+            self._fetch_gate_spot_tickers_direct(),
+            self._fetch_gate_futures_tickers_direct(),
+            self._fetch_gate_funding_rates_direct(),
             self._fetch_gate_taker_fees(),
         )
         spot_taker_fees, futures_taker_fees = fee_pair
@@ -1615,7 +1870,7 @@ class FundingArbitrageBot:
             futures_qv = self._safe_float(futures_ticker.get("quoteVolume"))
 
             spot_symbol = f"{base}/USDT"
-            spot_market = self.gate_spot.markets.get(spot_symbol)
+            spot_market = (getattr(self.gate_spot, "markets", None) or {}).get(spot_symbol)
             if not spot_market or not spot_market.get("active", True):
                 continue
             spot_ticker = spot_tickers.get(spot_symbol, {})
@@ -1672,28 +1927,67 @@ class FundingArbitrageBot:
     # ── 跨交易所资金费率套利扫描 ──
 
     async def _scan_cross_exchange(self, position_usdt: float = 100.0,
-                                     strict: bool = True) -> pd.DataFrame:
+                                     strict: bool = True, snipe: bool = False) -> pd.DataFrame:
         """扫描跨交易所费率差异机会：纯期货多空对冲。
 
         高费率所做空 + 低费率所做多 = delta 中性，赚费率差。
         strict=False: 放宽筛选，用于展示接近阈值的候选。
+        snipe=True: 狙击刷新模式，只拉费率+Gate价格，复用缓存中的手续费和BN价格。
         """
         if not CROSS_EXCHANGE_ENABLED:
             return pd.DataFrame()
 
-        # 并行获取两所费率 + 手续费 + 全量ticker（用于价格校验）
-        bn_fee_pair, gt_fee_pair, bn_funding, gt_funding, bn_tickers, gt_tickers = await asyncio.gather(
-            self.fetch_taker_fees(),
-            self._fetch_gate_taker_fees(),
-            self._safe_request("futures.fetch_funding_rates",
-                               lambda: self.futures.fetch_funding_rates(), default={}),
-            self._safe_request("gate_futures.fetch_funding_rates",
-                               lambda: self.gate_futures.fetch_funding_rates(), default={}),
-            self._safe_request("futures.fetch_tickers",
-                               lambda: self.futures.fetch_tickers(), default={}),
-            self._safe_request("gate_futures.fetch_tickers",
-                               lambda: self.gate_futures.fetch_tickers(), default={}),
-        )
+        cache = getattr(self, "_cross_scan_cache", {})
+
+        if snipe and cache:
+            # 狙击模式：只刷新 BN 资金费率 + Gate tickers（含费率），手续费/BN价格不变
+            bn_funding, gt_tickers = await asyncio.gather(
+                self._safe_request("futures.fetch_funding_rates",
+                                   lambda: self.futures.fetch_funding_rates(), default={}),
+                self._safe_request("gate_futures.fetch_tickers_direct",
+                                   lambda: self._fetch_gate_futures_tickers_direct(), default={}),
+            )
+            gt_funding = await self._fetch_gate_funding_rates_direct(gt_tickers)
+            bn_fee_pair = cache["bn_fee_pair"]
+            gt_fee_pair = cache["gt_fee_pair"]
+            bn_tickers = cache["bn_tickers"]
+            # 更新缓存中的费率和 GT tickers（但不改 ts，主扫缓存仍有效）
+            cache["bn_funding"] = bn_funding
+            cache["gt_funding"] = gt_funding
+            cache["gt_tickers"] = gt_tickers
+        else:
+            # 复用缓存数据，避免严格+宽松两次扫描重复拉取
+            now = time.time()
+            if cache and (now - cache.get("ts", 0)) < 120:
+                bn_fee_pair = cache["bn_fee_pair"]
+                gt_fee_pair = cache["gt_fee_pair"]
+                bn_funding = cache["bn_funding"]
+                gt_funding = cache["gt_funding"]
+                bn_tickers = cache["bn_tickers"]
+                gt_tickers = cache["gt_tickers"]
+            else:
+                # 所有 API 并行拉取：tickers + 费率 + 资金费率
+                gt_tickers_raw, bn_fee_pair, gt_fee_pair, bn_funding, bn_tickers = await asyncio.gather(
+                    self._safe_request("gate_futures.fetch_tickers_direct",
+                                       lambda: self._fetch_gate_futures_tickers_direct(), default={}),
+                    self.fetch_taker_fees(),
+                    self._fetch_gate_taker_fees(),
+                    self._safe_request("futures.fetch_funding_rates",
+                                       lambda: self.futures.fetch_funding_rates(), default={}),
+                    self._safe_request("futures.fetch_tickers",
+                                       lambda: self.futures.fetch_tickers(), default={}),
+                )
+                gt_tickers = gt_tickers_raw
+                gt_funding = await self._fetch_gate_funding_rates_direct(gt_tickers)
+                self._cross_scan_cache = {
+                    "ts": time.time(),  # 数据就绪时间，非请求发起时间
+                    "bn_fee_pair": bn_fee_pair,
+                    "gt_fee_pair": gt_fee_pair,
+                    "bn_funding": bn_funding,
+                    "gt_funding": gt_funding,
+                    "bn_tickers": bn_tickers,
+                    "gt_tickers": gt_tickers,
+                }
         _, bn_futures_fee_dict = bn_fee_pair
         _, gt_futures_fee_dict = gt_fee_pair
         bn_futures_fee = float(bn_futures_fee_dict.get("__default__",
@@ -1844,7 +2138,7 @@ class FundingArbitrageBot:
         """
         # Try main spot
         spot_symbol = f"{base}/USDT"
-        spot_market = self.spot.markets.get(spot_symbol)
+        spot_market = (getattr(self.spot, "markets", None) or {}).get(spot_symbol)
         if spot_market and self._is_valid_spot_usdt_market(spot_symbol, spot_market):
             ticker = spot_tickers.get(spot_symbol, {})
             return (
@@ -1913,7 +2207,7 @@ class FundingArbitrageBot:
                     if asset and rate > 0:
                         rates[asset] = rate
             except Exception:
-                self.logger.warning(f"借币利率批量查询失败: {batch}", exc_info=True)
+                logger.warning(f"借币利率批量查询失败: {batch}", exc_info=True)
         return rates
 
     @staticmethod
@@ -1925,7 +2219,10 @@ class FundingArbitrageBot:
 
     def _build_futures_market_index(self) -> dict[str, dict[str, Any]]:
         index: dict[str, dict[str, Any]] = {}
-        for market in self.futures.markets.values():
+        bn_markets = getattr(self.futures, "markets", None)
+        if not bn_markets:
+            return index
+        for market in bn_markets.values():
             is_usdt_swap = (
                 market.get("swap")
                 and market.get("linear")
@@ -1939,7 +2236,10 @@ class FundingArbitrageBot:
     def _build_gate_futures_market_index(self) -> dict[str, dict[str, Any]]:
         """Gate.io 版: 构建 USDT 永续合约 base → market 索引。"""
         index: dict[str, dict[str, Any]] = {}
-        for market in self.gate_futures.markets.values():
+        gt_markets = getattr(self.gate_futures, "markets", None)
+        if not gt_markets:
+            return index
+        for market in gt_markets.values():
             is_usdt_swap = (
                 market.get("swap")
                 and market.get("linear")
@@ -1974,25 +2274,15 @@ class FundingArbitrageBot:
         spot_fees: dict[str, float] = {"__default__": spot_base * (1 - GATE_SPOT_REBATE)}
         fut_fees: dict[str, float] = {"__default__": fut_base * (1 - GATE_FUTURES_REBATE)}
 
+        # 现货费率 — 直连 REST
         spot_raw_rate: float = 0.0
-        valid_spot_symbols = {
-            m["symbol"] for m in self.gate_spot.markets.values()
-            if m.get("spot") and m.get("quote") == "USDT" and m.get("active", True)
-        }
         try:
-            spot_raw = await self._safe_request(
-                "gate.fetch_trading_fees",
-                lambda: self.gate_spot.fetch_trading_fees(),
-                default=None,
-            )
-            if spot_raw:
-                for sym, info in spot_raw.items():
-                    taker = self._safe_float(info.get("taker", 0))
-                    if taker > 0 and sym in valid_spot_symbols:
-                        eff = taker * (1 - GATE_SPOT_REBATE)
-                        spot_fees[sym] = eff
-                        spot_fees["__default__"] = eff
-                        spot_raw_rate = taker
+            spot_raw = await self._gate_request("/spot/fee", timeout=10)
+            taker = float((spot_raw.get("taker_fee", 0) or 0))
+            if taker > 0:
+                eff = taker * (1 - GATE_SPOT_REBATE)
+                spot_fees["__default__"] = eff
+                spot_raw_rate = taker
         except Exception:
             pass
         if spot_raw_rate > 0:
@@ -2003,12 +2293,13 @@ class FundingArbitrageBot:
             logger.warning("Gate 现货费率查询失败，使用默认值 %.3f%%",
                            spot_fees["__default__"] * 100)
 
+        # 合约费率 — Gate v4 无独立 fee 端点，回退 ccxt
         fut_raw_rate: float = 0.0
-        # 只信任 USDT 永续合约的交易对，排除 delivery/spot 混入
+        gt_markets = getattr(self.gate_futures, "markets", None)
         valid_fut_symbols = {
-            m["symbol"] for m in self.gate_futures.markets.values()
+            m["symbol"] for m in (gt_markets or {}).values()
             if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
-        }
+        } if gt_markets else set()
         try:
             fut_raw = await self._safe_request(
                 "gate_futures.fetch_trading_fees",
@@ -2036,18 +2327,14 @@ class FundingArbitrageBot:
         return spot_fees, fut_fees
 
     async def _load_gate_margin_bases(self) -> list[str]:
-        """拉取 Gate 所有可逐仓借贷的币种列表（公开接口，缓存 24h）。"""
+        """拉取 Gate 所有可逐仓借贷的币种列表（公开接口，缓存 24h，直连 REST）。"""
         now = time.monotonic()
         if self._gate_margin_bases and (now - self._gate_margin_bases_ts) < 86_400:
             return self._gate_margin_bases
         try:
-            resp = await self._safe_request(
-                "gate_margin_currency_pairs",
-                lambda: self.gate_spot.public_margin_get_uni_currency_pairs(),
-                default=[],
-            )
+            resp = await self._gate_request("/margin/uni/currency_pairs", timeout=15)
             bases: set[str] = set()
-            for item in resp:
+            for item in (resp if isinstance(resp, list) else []):
                 pair = str(item.get("currency_pair", "") if isinstance(item, dict) else "")
                 if pair.endswith("_USDT") and pair.count("_") == 1:
                     bases.add(pair.replace("_USDT", "").upper())
@@ -2059,10 +2346,10 @@ class FundingArbitrageBot:
         return self._gate_margin_bases
 
     async def _fetch_gate_margin_borrow_rates(self, assets: list[str]) -> dict[str, float]:
-        """Gate 逐仓借币利率（ccxt 隐式 API，复用连接池）。
+        """Gate 逐仓借币利率。
         先加载 Gate 支持借贷的币种列表，只查已知可借贷的币，避免大量无意义查询。
         返回 {base_upper: hourly_rate_float}。"""
-        if not assets or not GATE_API_KEY or not self.gate_spot:
+        if not assets or not GATE_API_KEY:
             return {}
 
         # 预先筛掉 Gate 不支持借币的币种（大部分都不可借，筛掉后批量请求不会整批失败）
@@ -2113,7 +2400,7 @@ class FundingArbitrageBot:
         """Gate 现货 USDT 可用余额。"""
         bal = await self._safe_request(
             "gate_spot.fetch_balance",
-            lambda: self.gate_spot.fetch_balance(),
+            lambda: self._fetch_gate_spot_balance_direct(),
             default={},
         )
         return self._free_balance(bal, "USDT")
@@ -2122,7 +2409,7 @@ class FundingArbitrageBot:
         """Gate 合约 USDT 可用余额。"""
         bal = await self._safe_request(
             "gate_futures.fetch_balance",
-            lambda: self.gate_futures.fetch_balance(),
+            lambda: self._fetch_gate_futures_balance_direct(),
             default={},
         )
         return self._free_balance(bal, "USDT")
@@ -2132,7 +2419,7 @@ class FundingArbitrageBot:
         try:
             bal = await self._safe_request(
                 "gate_futures.fetch_balance_total",
-                lambda: self.gate_futures.fetch_balance(),
+                lambda: self._fetch_gate_futures_balance_direct(),
                 default={},
             )
             return float(bal.get("USDT", {}).get("total", 0) or 0)
@@ -2143,19 +2430,17 @@ class FundingArbitrageBot:
         self, amount: float, from_account: str, to_account: str,
         symbol: str | None = None,
     ) -> bool:
-        """Gate 内部资金划转。margin 划转需传 symbol 参数。"""
-        params: dict[str, Any] = {}
+        """Gate 内部资金划转 (直连 REST)。margin 划转需传 symbol 参数。"""
+        body: dict[str, Any] = {
+            "currency": "USDT",
+            "from": from_account,
+            "to": to_account,
+            "amount": str(self._floor_usdt(amount)),
+        }
         if symbol and ("margin" in (from_account, to_account)):
-            params["symbol"] = symbol
+            body["currency_pair"] = symbol.replace("/", "_")
         try:
-            await self._safe_request(
-                f"gate_transfer_{from_account}_to_{to_account}",
-                lambda: self.gate_spot.transfer(
-                    "USDT", self._floor_usdt(amount),
-                    from_account, to_account, params=params,
-                ),
-                raise_error=True,
-            )
+            await self._gate_request("/wallet/transfers", body=body, method="POST", timeout=15)
             logger.info("Gate 划转: %.2f USDT %s → %s", amount, from_account, to_account)
             return True
         except Exception as exc:
@@ -2180,39 +2465,51 @@ class FundingArbitrageBot:
 
     async def _gate_spot_order(self, symbol: str, side: str,
                                 amount: float) -> dict[str, Any]:
-        """Gate 现货市价单 via ccxt。"""
+        """Gate 现货市价单 — 直连 REST，省 ccxt 框架开销。"""
         precise = float(self.gate_spot.amount_to_precision(symbol, amount))
-        order = await self._safe_request(
-            f"gate_spot.{side}_order",
-            lambda: self.gate_spot.create_order(symbol, "market", side, precise),
-            raise_error=True,
-        )
-        filled = float(order.get("filled", 0))
-        ok = order.get("status") == "closed" and filled >= precise * 0.9
-        return {"id": str(order.get("id", "")), "symbol": symbol, "side": side,
+        pair = symbol.replace("/", "_")
+        body = {
+            "currency_pair": pair, "side": side, "type": "market",
+            "amount": str(precise), "account": "spot", "time_in_force": "ioc",
+        }
+        resp = await self._gate_request("/spot/orders", body=body, method="POST", timeout=15)
+        filled = float(resp.get("filled_amount", resp.get("filled_total", 0)) or 0)
+        ok = resp.get("status") == "closed" and filled >= precise * 0.9
+        return {"id": str(resp.get("id", "")), "symbol": symbol, "side": side,
                 "amount": precise, "filled": filled,
-                "status": "closed" if ok else "open", "info": order}
+                "status": "closed" if ok else "open", "info": resp}
 
-    async def _gate_futures_order(self, symbol: str, side: str,
-                                   amount: float, reduce_only: bool = False) -> dict[str, Any]:
-        """Gate 合约市价单 via ccxt。"""
+    async def _gate_futures_order_direct(self, symbol: str, side: str,
+                                          amount: float, reduce_only: bool = False) -> dict[str, Any]:
+        """Gate 合约市价单 — 绕过 ccxt，直连 REST API，省框架开销。
+        gate.io v4: size>0=买, size<0=卖; tif=ioc 市价立即成交或取消。"""
+        contract = self._to_gate_contract(symbol)
         precise = float(self.gate_futures.amount_to_precision(symbol, amount))
-        params: dict[str, Any] = {"reduceOnly": reduce_only} if reduce_only else {}
-        order = await self._safe_request(
-            f"gate_futures.{side}_order",
-            lambda: self.gate_futures.create_order(symbol, "market", side, precise, params=params),
-            raise_error=True,
-        )
-        filled = float(order.get("filled", 0))
-        ok = order.get("status") == "closed" and filled >= precise * 0.9
-        return {"id": str(order.get("id", "")), "symbol": symbol, "side": side,
-                "amount": precise, "filled": filled,
-                "status": "closed" if ok else "open", "info": order}
+        size = precise if side == "buy" else -precise
+        body: dict[str, Any] = {
+            "contract": contract, "size": size, "price": "0", "tif": "ioc",
+        }
+        if reduce_only:
+            body["reduce_only"] = True
+        resp = await self._gate_request("/futures/usdt/orders", body=body, method="POST")
+        filled = abs(float(resp.get("size", 0) or 0)) - abs(float(resp.get("left", 0) or 0))
+        finished = resp.get("status") == "finished"
+        return {
+            "id": str(resp.get("id", "")), "symbol": symbol, "side": side,
+            "amount": precise, "filled": filled,
+            "status": "closed" if finished else ("partial" if filled > 0 else "open"),
+            "info": resp,
+        }
 
     async def _gate_set_leverage(self, symbol: str) -> bool:
-        """Gate 合约设置杠杆 1x。"""
+        """Gate 合约设置杠杆 1x (leverage 以 query string 传递，非 JSON body)。"""
         try:
-            await self.gate_futures.set_leverage(CROSS_LEVERAGE, symbol)
+            contract = self._to_gate_contract(symbol)
+            await self._gate_request(
+                f"/futures/usdt/positions/{contract}/leverage",
+                method="POST", timeout=10,
+                params={"leverage": str(CROSS_LEVERAGE)},
+            )
             return True
         except Exception as exc:
             logger.warning("Gate 设置杠杆失败 %s: %s", symbol, exc)
@@ -2264,16 +2561,13 @@ class FundingArbitrageBot:
         return amount
 
     async def _gate_fetch_next_funding_time(self, futures_symbol: str) -> float:
-        """获取 Gate 合约下次资金费率结算时间 (ms)。"""
+        """获取 Gate 合约下次资金费率结算时间 (ms) — 直连 REST。"""
         try:
-            info = await self._safe_request(
-                f"gate_futures.fetch_funding_rate({futures_symbol})",
-                lambda: self.gate_futures.fetch_funding_rate(futures_symbol),
-                default={},
-            )
-            nft = info.get("nextFundingTime") or info.get("nextFundingTimestamp")
+            contract = self._to_gate_contract(futures_symbol)
+            info = await self._gate_request(f"/futures/usdt/contracts/{contract}", timeout=10)
+            nft = info.get("funding_next_apply")
             if nft and float(nft) > 0:
-                return float(nft)
+                return float(nft) * 1000  # Gate 返回秒，转为 ms
         except Exception:
             pass
         return time.time() * 1000 + DEFAULT_FUNDING_INTERVAL_HOURS * 3600_000
@@ -2297,7 +2591,7 @@ class FundingArbitrageBot:
 
     async def _open_gate_futures_short_leg(self, symbol: str, amount: float) -> LegResult:
         try:
-            order = await self._gate_futures_order(symbol, "sell", amount)
+            order = await self._gate_futures_order_direct(symbol, "sell", amount)
             return LegResult(True, "gate_futures", symbol, "sell", amount, order=order)
         except Exception as exc:
             return LegResult(False, "gate_futures", symbol, "sell", amount, error=str(exc))
@@ -2305,14 +2599,14 @@ class FundingArbitrageBot:
     async def _close_gate_futures_short_leg(self, symbol: str, amount: float) -> LegResult:
         try:
             precise = float(self.gate_futures.amount_to_precision(symbol, amount))
-            order = await self._gate_futures_order(symbol, "buy", precise, reduce_only=True)
+            order = await self._gate_futures_order_direct(symbol, "buy", precise, reduce_only=True)
             return LegResult(True, "gate_futures", symbol, "buy", precise, order=order)
         except Exception as exc:
             return LegResult(False, "gate_futures", symbol, "buy", amount, error=str(exc))
 
     async def _open_gate_futures_long_leg(self, symbol: str, amount: float) -> LegResult:
         try:
-            order = await self._gate_futures_order(symbol, "buy", amount)
+            order = await self._gate_futures_order_direct(symbol, "buy", amount)
             return LegResult(True, "gate_futures", symbol, "buy", amount, order=order)
         except Exception as exc:
             return LegResult(False, "gate_futures", symbol, "buy", amount, error=str(exc))
@@ -2320,7 +2614,7 @@ class FundingArbitrageBot:
     async def _close_gate_futures_long_leg(self, symbol: str, amount: float) -> LegResult:
         try:
             precise = float(self.gate_futures.amount_to_precision(symbol, amount))
-            order = await self._gate_futures_order(symbol, "sell", precise, reduce_only=True)
+            order = await self._gate_futures_order_direct(symbol, "sell", precise, reduce_only=True)
             return LegResult(True, "gate_futures", symbol, "sell", precise, order=order)
         except Exception as exc:
             return LegResult(False, "gate_futures", symbol, "sell", amount, error=str(exc))
@@ -2328,9 +2622,11 @@ class FundingArbitrageBot:
     # ── Gate.io 保证金方法 ──
 
     async def _gate_margin_borrow(self, symbol: str, base: str, amount: float) -> bool:
-        """Gate 逐仓借币。"""
+        """Gate 逐仓借币 — 直连 REST。"""
         try:
-            await self.gate_spot.borrow_isolated_margin(symbol, base, amount)
+            pair = symbol.replace("/", "_")
+            body = {"currency_pair": pair, "currency": base, "amount": str(amount)}
+            await self._gate_request("/margin/uni/loans", body=body, method="POST", timeout=15)
             logger.info("Gate 借币: %s %s (pair=%s)", amount, base, symbol)
             return True
         except Exception as exc:
@@ -2341,9 +2637,27 @@ class FundingArbitrageBot:
             return False
 
     async def _gate_margin_repay(self, symbol: str, base: str, amount: float) -> bool:
-        """Gate 逐仓还款。"""
+        """Gate 逐仓还款 — 直连 REST（查贷款 ID 后还款）。"""
         try:
-            await self.gate_spot.repay_isolated_margin(symbol, base, amount)
+            pair = symbol.replace("/", "_")
+            # 先查该币种的未还贷款
+            loans = await self._gate_request(
+                f"/margin/uni/loans?currency_pair={pair}&currency={base}&status=open",
+                timeout=10,
+            )
+            loans_list = loans if isinstance(loans, list) else []
+            if not loans_list:
+                logger.warning("Gate 还款: 无未还贷款 %s %s", base, symbol)
+                return False
+            # 取第一笔贷款 ID 还款
+            loan_id = str(loans_list[0].get("id", ""))
+            if not loan_id:
+                logger.error("Gate 还款: 无法获取贷款 ID %s %s", base, symbol)
+                return False
+            await self._gate_request(
+                f"/margin/uni/loans/{loan_id}",
+                body={"amount": str(amount), "currency": base}, method="PATCH", timeout=15,
+            )
             logger.info("Gate 还款: %s %s (pair=%s)", amount, base, symbol)
             return True
         except Exception as exc:
@@ -2351,21 +2665,22 @@ class FundingArbitrageBot:
             return False
 
     async def _gate_query_margin_account(self, symbol: str) -> dict[str, Any]:
-        """查询 Gate 逐仓账户状态。"""
+        """查询 Gate 逐仓账户状态 — 直连 REST。"""
         base = symbol.split("/")[0]
         try:
-            bal = await self._safe_request(
-                "gate_margin.fetch_balance",
-                lambda: self.gate_spot.fetch_balance(params={"type": "margin"}),
-                default={},
+            pair = symbol.replace("/", "_")
+            acct = await self._gate_request(
+                f"/margin/uni/accounts?currency_pair={pair}", timeout=10,
             )
-            base_free = self._free_balance(bal, base)
-            base_used = float((bal.get("used", {}) or {}).get(base, 0))
-            base_debt = float((bal.get("debt", {}) or {}).get(base, 0))
-            usdt_free = self._free_balance(bal, "USDT")
-            return {"base_net": base_free + base_used - base_debt,
+            b = acct.get("base", {}) if isinstance(acct, dict) else {}
+            q = acct.get("quote", {}) if isinstance(acct, dict) else {}
+            base_avail = float(b.get("available", 0) or 0)
+            base_locked = float(b.get("locked", 0) or 0)
+            base_debt = float(b.get("borrowed", 0) or 0)
+            usdt_avail = float(q.get("available", 0) or 0)
+            return {"base_net": base_avail + base_locked - base_debt,
                     "base_borrowed": base_debt,
-                    "quote_net": usdt_free,
+                    "quote_net": usdt_avail,
                     "margin_level": 0.0}
         except Exception as exc:
             logger.warning("Gate 查询 margin 账户失败 %s: %s", symbol, exc)
@@ -2379,7 +2694,7 @@ class FundingArbitrageBot:
             return False
         bal = await self._safe_request(
             "gate_spot.fetch_balance_for_position",
-            lambda: self.gate_spot.fetch_balance(),
+            lambda: self._fetch_gate_spot_balance_direct(),
             default={},
         )
         free = float((bal.get("free", {}) or {}).get(self.gate_state.base, 0))
@@ -2391,7 +2706,7 @@ class FundingArbitrageBot:
             return False
         positions = await self._safe_request(
             "gate_futures.fetch_positions",
-            lambda: self.gate_futures.fetch_positions([self.gate_state.futures_symbol]),
+            lambda: self._fetch_gate_positions_direct(self.gate_state.futures_symbol),
             default=[],
         )
         for pos in positions:
@@ -2667,42 +2982,38 @@ class FundingArbitrageBot:
             await self._gate_margin_repay(symbol, base, margin_result.amount)
 
     async def _open_gate_margin_spot_leg(self, symbol: str, amount: float) -> LegResult:
-        """Gate margin 卖出（卖出借入的币）。"""
+        """Gate margin 卖出（卖出借入的币）— 直连 REST。"""
         try:
             precise = float(self.gate_spot.amount_to_precision(symbol, amount))
-            order = await self._safe_request(
-                "gate_margin_sell",
-                lambda: self.gate_spot.create_order(
-                    symbol, "market", "sell", precise,
-                    params={"account": "margin"},
-                ),
-                raise_error=True,
-            )
-            filled = float(order.get("filled", 0))
-            ok = order.get("status") == "closed" and filled >= precise * 0.9
+            pair = symbol.replace("/", "_")
+            body = {
+                "currency_pair": pair, "side": "sell", "type": "market",
+                "amount": str(precise), "account": "margin", "time_in_force": "ioc",
+            }
+            resp = await self._gate_request("/spot/orders", body=body, method="POST", timeout=15)
+            filled = float(resp.get("filled_amount", resp.get("filled_total", 0)) or 0)
+            ok = resp.get("status") == "closed" and filled >= precise * 0.9
             return LegResult(ok, "gate_margin", symbol, "sell", precise,
-                             order={"id": str(order.get("id", "")), "filled": filled,
-                                    "status": "closed" if ok else "open", "info": order})
+                             order={"id": str(resp.get("id", "")), "filled": filled,
+                                    "status": "closed" if ok else "open", "info": resp})
         except Exception as exc:
             return LegResult(False, "gate_margin", symbol, "sell", amount, error=str(exc))
 
     async def _close_gate_margin_spot_leg(self, symbol: str, amount: float) -> LegResult:
-        """Gate margin 买回（还币）。"""
+        """Gate margin 买回（还币）— 直连 REST。"""
         try:
             precise = float(self.gate_spot.amount_to_precision(symbol, amount))
-            order = await self._safe_request(
-                "gate_margin_buy",
-                lambda: self.gate_spot.create_order(
-                    symbol, "market", "buy", precise,
-                    params={"account": "margin"},
-                ),
-                raise_error=True,
-            )
-            filled = float(order.get("filled", 0))
-            ok = order.get("status") == "closed" and filled >= precise * 0.9
+            pair = symbol.replace("/", "_")
+            body = {
+                "currency_pair": pair, "side": "buy", "type": "market",
+                "amount": str(precise), "account": "margin", "time_in_force": "ioc",
+            }
+            resp = await self._gate_request("/spot/orders", body=body, method="POST", timeout=15)
+            filled = float(resp.get("filled_amount", resp.get("filled_total", 0)) or 0)
+            ok = resp.get("status") == "closed" and filled >= precise * 0.9
             return LegResult(ok, "gate_margin", symbol, "buy", precise,
-                             order={"id": str(order.get("id", "")), "filled": filled,
-                                    "status": "closed" if ok else "open", "info": order})
+                             order={"id": str(resp.get("id", "")), "filled": filled,
+                                    "status": "closed" if ok else "open", "info": resp})
         except Exception as exc:
             return LegResult(False, "gate_margin", symbol, "buy", amount, error=str(exc))
 
@@ -4044,6 +4355,7 @@ class FundingArbitrageBot:
 
         if not self.binance_state.is_open:
             return True
+        if self.binance_state.direction == "reverse":
             return await self._close_reverse_position()
 
         logger.info(
@@ -4242,6 +4554,639 @@ class FundingArbitrageBot:
             logger.warning("验证币安持仓失败 %s: %s", symbol, exc)
         return 0.0
 
+    async def _cross_verify_gate_position(self, symbol: str) -> float:
+        """验证 Gate 合约实际持仓量（处理 API 返回异常但实际已成交的情况）。"""
+        try:
+            positions = await self._safe_request(
+                "gate_futures.fetch_positions_verify",
+                lambda: self._fetch_gate_positions_direct(symbol),
+                default=[],
+            )
+            for pos in positions:
+                if pos.get("symbol") == symbol:
+                    return abs(float(pos.get("contracts", 0) or 0))
+        except Exception as exc:
+            logger.warning("验证Gate持仓失败 %s: %s", symbol, exc)
+        return 0.0
+
+    async def _query_bn_funding_amount(self, symbol: str, settle_ms: int) -> float:
+        """查币安结算时刻的实际 FUNDING_FEE 金额。"""
+        try:
+            clean = self._clean_futures_symbol(symbol)
+            resp = await self._binance_request(
+                BINANCE_FUTURES_API, "/fapi/v1/income",
+                {"symbol": clean, "incomeType": "FUNDING_FEE",
+                 "startTime": settle_ms - 5000, "endTime": settle_ms + 60000, "limit": 1},
+            )
+            if isinstance(resp, list) and resp:
+                return float(resp[0].get("income", 0) or 0)
+        except Exception:
+            pass
+        return 0.0
+
+    async def _check_bn_funding_received(self, symbol: str, after_ms: float) -> bool:
+        """检查币安是否已收到指定币种的资金费（结算时间之后）。"""
+        try:
+            clean = self._clean_futures_symbol(symbol)
+            resp = await self._binance_request(
+                BINANCE_FUTURES_API, "/fapi/v1/income",
+                {"symbol": clean, "incomeType": "FUNDING_FEE",
+                 "startTime": int(after_ms) - 5000, "limit": 3},
+            )
+            if isinstance(resp, list):
+                for item in resp:
+                    if isinstance(item, dict) and item.get("time", 0) >= after_ms - 1000:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    async def _check_gate_funding_received(self, symbol: str) -> bool:
+        """检查Gate是否已收到指定币种的资金费（通过持仓 pnl_fund 变化判断）。"""
+        try:
+            positions = await self._safe_request(
+                "gate_funding_check",
+                lambda: self._fetch_gate_positions_direct(symbol),
+                default=[],
+            )
+            for pos in positions:
+                if pos.get("symbol") == symbol:
+                    pnl_fund = float(pos.get("info", {}).get("pnl_fund", 0) or 0)
+                    if abs(pnl_fund) > 0.0001:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    async def _ensure_bn_funding_ws(self) -> None:
+        """确保 BN 用户数据流 WS 长连接存活（断线自动重连）。
+        启动时调用一次，之后持续监听 FUNDING_FEE 事件。"""
+        ws = getattr(self, "_funding_ws", None)
+        if ws and not ws.closed:
+            # 每 45min 刷新 listenKey（60min 有效期）
+            if time.time() - getattr(self, "_bn_listen_key_ts", 0) < 2700:
+                return
+            logger.info("[资费监听] listenKey 即将过期，刷新")
+            await self._close_bn_funding_ws()
+        try:
+            resp = await self._binance_request(
+                BINANCE_FUTURES_API, "/fapi/v1/listenKey", {}, method="POST",
+            )
+            self._bn_listen_key = resp.get("listenKey", "")
+            self._bn_listen_key_ts = time.time()
+            if not self._bn_listen_key:
+                logger.warning("[资费监听] listenKey 创建失败")
+                return
+            if not self._funding_session:
+                class _Resolver:
+                    async def resolve(self, host, port=0, family=0):
+                        if host == "fstream.binance.com":
+                            return [{"hostname": host, "host": "52.69.16.71", "port": port,
+                                     "family": socket.AF_INET, "proto": 6, "flags": socket.AI_NUMERICHOST}]
+                        return [{"hostname": host, "host": host, "port": port,
+                                 "family": socket.AF_INET, "proto": 6, "flags": 0}]
+                    async def close(self): pass
+                connector = aiohttp.TCPConnector(resolver=_Resolver(), ssl=False)
+                self._funding_session = aiohttp.ClientSession(connector=connector)
+            ws_url = f"wss://fstream.binance.com/ws/{self._bn_listen_key}"
+            self._funding_ws = await self._funding_session.ws_connect(ws_url)
+            logger.info("[资费监听] BN WS 长连接已建立")
+            asyncio.create_task(self._read_bn_funding_stream())
+        except Exception as exc:
+            logger.warning("[资费监听] BN WS 建立失败: %s", exc)
+
+    async def _close_bn_funding_ws(self) -> None:
+        """关闭 BN WS 长连接。"""
+        try:
+            ws = getattr(self, "_funding_ws", None)
+            if ws:
+                await ws.close()
+                self._funding_ws = None
+        except Exception:
+            pass
+        try:
+            if self._bn_listen_key:
+                await self._binance_request(
+                    BINANCE_FUTURES_API, "/fapi/v1/listenKey", {}, method="DELETE",
+                )
+                self._bn_listen_key = None
+        except Exception:
+            pass
+
+    async def _read_bn_funding_stream(self) -> None:
+        """持久读 BN 用户数据流，检测 FUNDING_FEE 设 event，断线自动重连。"""
+        import json as _json
+        while True:
+            try:
+                ws = getattr(self, "_funding_ws", None)
+                if not ws or ws.closed:
+                    break
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = _json.loads(msg.data)
+                        if data.get("e") == "ACCOUNT_UPDATE":
+                            if data.get("a", {}).get("m") == "FUNDING_FEE":
+                                logger.info("[资费监听] BN 资费已到账")
+                                self._funding_event.set()
+                        elif data.get("e") == "listenKeyExpired":
+                            logger.warning("[资费监听] listenKey 过期，重连")
+                            break
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+            except Exception as exc:
+                if "Connection" not in str(exc) and "closed" not in str(exc).lower():
+                    logger.warning("[资费监听] BN WS 读取异常: %s", exc)
+            # 断线重连
+            self._funding_ws = None
+            await asyncio.sleep(3)
+            try:
+                await self._ensure_bn_funding_ws()
+                break  # _ensure 会创建新的 reader task
+            except Exception:
+                logger.warning("[资费监听] BN WS 重连失败，3s后重试")
+                await asyncio.sleep(3)
+
+    async def _ensure_gate_funding_ws(self) -> None:
+        """确保 Gate 资费监听 WS 长连接存活，断线自动重连。
+        Gate futures.positions 订阅要求 payload 指定 1-2 个合约名，不支持空列表。
+        因此初始化时只建连接 + 启动 reader，开仓后通过 _gate_subscribe_position 动态订阅。"""
+        ws = getattr(self, "_gate_funding_ws", None)
+        if ws and not ws.closed:
+            return
+        await self._close_gate_funding_ws()
+        try:
+            if not self._gate_funding_session:
+                self._gate_funding_session = aiohttp.ClientSession()
+            self._gate_funding_ws = await asyncio.wait_for(
+                self._gate_funding_session.ws_connect("wss://fx-ws.gateio.ws/v4/ws/usdt"),
+                timeout=15,
+            )
+            await self._gate_ws_login(self._gate_funding_ws, label="资费监听")
+            logger.info("[资费监听] Gate WS 长连接已建立")
+            asyncio.create_task(self._read_gate_funding_stream())
+        except Exception as exc:
+            logger.warning("[资费监听] Gate WS 建立失败: %s", exc)
+
+    async def _gate_subscribe_position(self, contract: str) -> bool:
+        ws = getattr(self, "_gate_trade_ws", None)
+        if not ws or ws.closed:
+            logger.warning("Gate subscribe fail %s: trade WS not connected", contract)
+            return False
+        try:
+            t = int(time.time())
+            ch = "futures.positions"
+            ev = "subscribe"
+            sign_msg = f"channel={ch}&event={ev}&time={t}"
+            sign = hmac.new(GATE_API_SECRET.encode(), sign_msg.encode(), hashlib.sha512).hexdigest()
+            await ws.send_json({
+                "time": t, "channel": ch, "event": ev,
+                "payload": [contract],
+                "auth": {"method": "api_key", "KEY": GATE_API_KEY, "SIGN": sign},
+            })
+            logger.info("Gate subscribed %s on trade WS", contract)
+            return True
+        except Exception as exc:
+            logger.warning("Gate subscribe %s error: %s", contract, exc)
+            return False
+
+
+    async def _close_gate_funding_ws(self) -> None:
+        """关闭 Gate WS 长连接。"""
+        try:
+            ws = getattr(self, "_gate_funding_ws", None)
+            if ws:
+                await ws.close()
+                self._gate_funding_ws = None
+        except Exception:
+            pass
+
+    async def _read_gate_funding_stream(self) -> None:
+        """持久读 Gate WS，检测目标持仓 pnl_fund 变化设 event，断线自动重连。
+        每条消息实时读取 _gate_funding_symbol / _gate_funding_baseline，
+        配合 sniper 开仓后动态设定目标，持续监听不退出。"""
+        import json as _json
+        while True:
+            try:
+                ws = getattr(self, "_gate_funding_ws", None)
+                if not ws or ws.closed:
+                    break
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = _json.loads(msg.data)
+                        if data.get("channel") == "futures.ping":
+                            await ws.send_json({"time": int(time.time()), "channel": "futures.pong"})
+                        elif data.get("channel") == "futures.positions" and data.get("event") == "update":
+                            # 每条消息实时读目标（sniper 开仓后动态设定）
+                            symbol = getattr(self, "_gate_funding_symbol", "")
+                            baseline = getattr(self, "_gate_funding_baseline", 0.0)
+                            contract = self._to_gate_contract(symbol) if symbol else ""
+                            if not contract:
+                                continue
+                            for pos in data.get("result", []):
+                                if pos.get("contract") == contract:
+                                    pnl = float(pos.get("pnl_fund", 0) or 0)
+                                    if abs(pnl - baseline) > 0.0001:
+                                        self._gate_funding_amount = round(pnl - baseline, 6)
+                                        logger.info("[资费监听] Gate 资费到账: %s pnl_fund %.4f→%.4f (资费=%.4f)",
+                                                    symbol, baseline, pnl, self._gate_funding_amount)
+                                        self._gate_funding_event.set()
+                                        # 不退出 — 持续监听，sniper 清 event 设新 baseline 后继续检测
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+            except Exception as exc:
+                if "Connection" not in str(exc) and "closed" not in str(exc).lower():
+                    logger.warning("[资费监听] Gate WS 读取异常: %s", exc)
+            self._gate_funding_ws = None
+            await asyncio.sleep(3)
+            try:
+                await self._ensure_gate_funding_ws()
+                break  # _ensure 会创建新 reader task
+            except Exception:
+                logger.warning("[资费监听] Gate WS 重连失败，3s后重试")
+                await asyncio.sleep(3)
+
+
+    # ════════════════════════════════════════════════════════════════
+    # BN + Gate 交易 WS（持久长连接，下单省 HTTP 握手 + to_thread）
+    # ════════════════════════════════════════════════════════════════
+
+    async def _ensure_bn_trade_ws(self) -> None:
+        """确保 BN 交易 WS 长连接存活（wss://ws-fapi.binance.com/ws-fapi/v1），断线自动重连。"""
+        ws = getattr(self, "_bn_trade_ws", None)
+        if ws and not ws.closed:
+            return
+        await self._close_bn_trade_ws()
+        try:
+            if not self._bn_trade_session:
+                self._bn_trade_session = aiohttp.ClientSession()
+            self._bn_trade_ws = await self._bn_trade_session.ws_connect(
+                "wss://ws-fapi.binance.com/ws-fapi/v1"
+            )
+            logger.info("[交易WS] BN 交易 WS 长连接已建立")
+            asyncio.create_task(self._read_bn_trade_ws())
+        except Exception as exc:
+            logger.warning("[交易WS] BN 交易 WS 建立失败: %s", exc)
+
+    async def _close_bn_trade_ws(self) -> None:
+        """关闭 BN 交易 WS，取消所有等待中的订单。"""
+        try:
+            ws = getattr(self, "_bn_trade_ws", None)
+            if ws:
+                await ws.close()
+                self._bn_trade_ws = None
+        except Exception:
+            pass
+        for fut in getattr(self, "_bn_trade_futures", {}).values():
+            if not fut.done():
+                fut.set_exception(Exception("BN trade WS closed"))
+
+    async def _read_bn_trade_ws(self) -> None:
+        """持久读 BN 交易 WS 响应，按 id 分发到对应 Future，断线自动重连。"""
+        import json as _json
+        while True:
+            try:
+                ws = getattr(self, "_bn_trade_ws", None)
+                if not ws or ws.closed:
+                    break
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = _json.loads(msg.data)
+                        rid = data.get("id", "")
+                        if rid in getattr(self, "_bn_trade_futures", {}):
+                            fut = self._bn_trade_futures.pop(rid)
+                            if not fut.done():
+                                if data.get("status") == 200:
+                                    fut.set_result(data.get("result", {}))
+                                else:
+                                    err = data.get("error", {})
+                                    fut.set_exception(
+                                        Exception(f"BN WS order failed: {err}"))
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+            except Exception as exc:
+                if "Connection" not in str(exc) and "closed" not in str(exc).lower():
+                    logger.warning("[交易WS] BN 交易 WS 读取异常: %s", exc)
+            # 断线重连
+            self._bn_trade_ws = None
+            for fut in getattr(self, "_bn_trade_futures", {}).values():
+                if not fut.done():
+                    fut.set_exception(Exception("BN trade WS disconnected"))
+            self._bn_trade_futures.clear()
+            await asyncio.sleep(3)
+            try:
+                await self._ensure_bn_trade_ws()
+                break
+            except Exception:
+                await asyncio.sleep(3)
+
+    async def _bn_trade_ws_order(self, symbol: str, side: str, quantity: float,
+                                  reduce_only: bool = False,
+                                  position_side: str | None = None) -> dict[str, Any]:
+        """BN 合约下单 — 走持久 WS 长连接，省 HTTP 握手 + headers 开销。"""
+        import uuid as _uuid
+        await self._ensure_bn_trade_ws()
+        clean = self._clean_futures_symbol(symbol)
+        ts = int(time.time() * 1000)
+        params: dict[str, Any] = {
+            "apiKey": BINANCE_API_KEY,
+            "symbol": clean,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": quantity,
+            "timestamp": ts,
+            "recvWindow": 5000,
+        }
+        if position_side:
+            params["positionSide"] = position_side.upper()
+        elif reduce_only:
+            params["reduceOnly"] = "true"
+        # 签名（标准 Binance HMAC-SHA256，按 key 排序后 URL-encode）
+        sorted_items = sorted((str(k), str(v)) for k, v in params.items())
+        qs = "&".join(f"{k}={v}" for k, v in sorted_items)
+        params["signature"] = self._binance_sign(qs)
+
+        rid = str(_uuid.uuid4())[:8]
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._bn_trade_futures[rid] = fut
+        try:
+            t0 = time.perf_counter()
+            t0_ms = int(time.time() * 1000)
+            await self._bn_trade_ws.send_json(
+                {"id": rid, "method": "order.place", "params": params})
+            result = await asyncio.wait_for(fut, timeout=15.0)
+            t1 = time.perf_counter()
+            raw = result.get("result", {})
+            transact_time = raw.get("transactTime", 0) or raw.get("updateTime", 0)
+            fill_ms = transact_time - t0_ms if transact_time > 0 else 0
+            logger.info("[延迟] BN WS 下单 %s %s: 往返 %.0fms | 成交 %dms",
+                        symbol, side, (t1 - t0) * 1000, fill_ms)
+            # 传内层 result（含 executedQty / status:FILLED），非外层信封（status:200）
+            order = self._normalize_order_response(raw, symbol, side, quantity)
+            if order["status"] == "open":
+                raise ExchangeError(
+                    f"合约{side}未成交: {symbol} filled=0/{quantity}")
+            if order["status"] == "partial":
+                logger.warning("合约%s部分成交: filled=%.4f/%.4f (%.0f%%)",
+                               symbol, order["filled"], quantity,
+                               order["filled"] / quantity * 100 if quantity > 0 else 0)
+            return order
+        except asyncio.TimeoutError:
+            self._bn_trade_futures.pop(rid, None)
+            raise Exception(f"BN WS order timeout: {symbol} {side}")
+        except Exception:
+            self._bn_trade_futures.pop(rid, None)
+            raise
+
+    # ── Gate 交易 WS（futures.order_place 频道直连下单） ──
+
+    async def _ensure_gate_trade_ws(self) -> None:
+        """确保 Gate 交易 WS 长连接存活（futures.order_place），断线自动重连，先 login 再就绪。"""
+        ws = getattr(self, "_gate_trade_ws", None)
+        if ws and not ws.closed:
+            return
+        await self._close_gate_trade_ws()
+        try:
+            if not self._gate_trade_session:
+                self._gate_trade_session = aiohttp.ClientSession()
+            self._gate_trade_ws = await self._gate_trade_session.ws_connect(
+                "wss://fx-ws.gateio.ws/v4/ws/usdt"
+            )
+            logger.info("[交易WS] Gate 交易 WS 长连接已建立")
+            await self._gate_ws_login(self._gate_trade_ws, label="交易WS")
+            asyncio.create_task(self._read_gate_trade_ws())
+            asyncio.create_task(self._gate_trade_ws_ping())
+        except Exception as exc:
+            logger.warning("[交易WS] Gate 交易 WS 建立失败: %s", exc)
+
+    async def _gate_ws_login(self, ws=None, label: str = "交易WS") -> None:
+        """Gate WS request_private 登录 futures.login，登录后可发 request/subscribe。
+        ws 默认使用 _gate_trade_ws，也可传入其他 WS 连接。"""
+        import uuid as _uuid
+        if ws is None:
+            ws = getattr(self, "_gate_trade_ws", None)
+        if not ws or ws.closed:
+            raise Exception(f"Gate WS login: ws 未连接")
+        channel = "futures.login"
+        event = "api"
+        req_id = _uuid.uuid4().hex[:16]
+        t = int(time.time())
+        req_params: dict[str, Any] = {}
+        sign_msg = f"{event}\n{channel}\n{json.dumps(req_params, separators=(',', ':'))}\n{t}"
+        sign = hmac.new(
+            GATE_API_SECRET.encode(), sign_msg.encode(), hashlib.sha512,
+        ).hexdigest()
+        msg = {
+            "id": req_id, "time": t, "channel": channel, "event": event,
+            "payload": {
+                "req_id": req_id, "timestamp": str(t),
+                "api_key": GATE_API_KEY, "signature": sign,
+                "req_param": req_params,
+                "req_header": {"X-Gate-Channel-Id": "ccxt"},
+            },
+        }
+        await ws.send_json(msg)
+        t_deadline = time.perf_counter() + 10.0
+        while time.perf_counter() < t_deadline:
+            try:
+                raw = await asyncio.wait_for(ws.receive(), timeout=t_deadline - time.perf_counter())
+            except asyncio.TimeoutError:
+                raise Exception("Gate WS login timeout")
+            if raw.type == aiohttp.WSMsgType.TEXT:
+                d = json.loads(raw.data)
+                hdr = d.get("header", {})
+                if hdr.get("channel") == channel and hdr.get("event") == event:
+                    if hdr.get("status") == "200":
+                        logger.info("[%s] Gate WS 登录成功", label)
+                        return
+                    raise Exception(f"Gate WS login failed: status={hdr.get('status')}")
+            elif raw.type == aiohttp.WSMsgType.CLOSED:
+                raise Exception(f"Gate WS closed during login: code={raw.data}")
+        raise Exception("Gate WS login timeout")
+
+    async def _read_gate_trade_ws(self) -> None:
+        """持久读 Gate 交易 WS 响应：下单回执 + 持仓变动（资费结算监听），断线自动重连。"""
+        import json as _json
+        while True:
+            try:
+                ws = getattr(self, "_gate_trade_ws", None)
+                if not ws or ws.closed:
+                    break
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = _json.loads(msg.data)
+                        hdr = data.get("header", {})
+                        ch = hdr.get("channel", "") or data.get("channel", "")
+                        ev = hdr.get("event", "") or data.get("event", "")
+                        if ch == "futures.ping":
+                            await ws.send_json({"time": int(time.time()), "channel": "futures.pong"})
+                        # ── 持仓变动（资费结算监听）──
+                        elif ch == "futures.positions" and ev == "update":
+                            symbol = getattr(self, "_gate_funding_symbol", "")
+                            baseline = getattr(self, "_gate_funding_baseline", 0.0)
+                            contract = self._to_gate_contract(symbol) if symbol else ""
+                            if contract:
+                                result = data.get("data", {}).get("result", data.get("result", []))
+                                for pos in (result if isinstance(result, list) else [result]):
+                                    if pos.get("contract") == contract:
+                                        pnl = float(pos.get("pnl_fund", 0) or 0)
+                                        if abs(pnl - baseline) > 0.0001:
+                                            self._gate_funding_amount = round(pnl - baseline, 6)
+                                            logger.info("[资费监听] Gate 资费到账: %s pnl_fund %.4f→%.4f (资费=%.4f)",
+                                                        symbol, baseline, pnl, self._gate_funding_amount)
+                                            self._gate_funding_event.set()
+                        # ── 下单回执 ──
+                        elif ch == "futures.order_place" and ev == "api":
+                            rid = data.get("request_id", "")
+                            result = data.get("data", {}).get("result", {})
+                            order = result[0] if isinstance(result, list) else result
+                            for key in (rid, order.get("text", ""), str(order.get("id", ""))):
+                                if key and key in getattr(self, "_gate_trade_futures", {}):
+                                    fut = self._gate_trade_futures[key]  # 不 pop，ack 消息不解析
+                                    if not fut.done():
+                                        errs = data.get("data", {}).get("errs", {})
+                                        if errs:
+                                            self._gate_trade_futures.pop(key, None)
+                                            fut.set_exception(
+                                                Exception(f"Gate WS order error: {errs.get('message', '') or str(errs)}"))
+                                        elif hdr.get("status") and hdr.get("status") != "200":
+                                            self._gate_trade_futures.pop(key, None)
+                                            fut.set_exception(
+                                                Exception(f"Gate WS order failed: status={hdr.get('status')}"))
+                                        elif "id" in order:
+                                            self._gate_trade_futures.pop(key, None)
+                                            fut.set_result(order)
+                                        # else: ack-only 回执 (无 id)，不解析，等第二条消息
+                                    break
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+            except Exception as exc:
+                if "Connection" not in str(exc) and "closed" not in str(exc).lower():
+                    logger.warning("[交易WS] Gate 交易 WS 读取异常: %s", exc)
+            # 断线重连
+            self._gate_trade_ws = None
+            for fut in getattr(self, "_gate_trade_futures", {}).values():
+                if not fut.done():
+                    fut.set_exception(Exception("Gate trade WS disconnected"))
+            self._gate_trade_futures.clear()
+            await asyncio.sleep(3)
+            try:
+                await self._ensure_gate_trade_ws()
+                break
+            except Exception:
+                await asyncio.sleep(3)
+
+    async def _gate_trade_ws_order(self, symbol: str, side: str,
+                                    amount: float, reduce_only: bool = False,
+                                    ) -> dict[str, Any]:
+        """Gate 合约市价单 — 走 WS futures.order_place 持久连接。
+        使用 request_private 认证模式（api_key + signature 嵌入 payload），
+        而非 subscribe_private 的 auth.method 模式。"""
+        import uuid as _uuid
+        await self._ensure_gate_trade_ws()
+        contract = self._to_gate_contract(symbol)
+        precise = int(float(self.gate_futures.amount_to_precision(symbol, amount)))
+        size = precise if side == "buy" else -precise
+        t = int(time.time())
+        text = f"t-{_uuid.uuid4().hex[:8]}"
+        req_id = _uuid.uuid4().hex[:16]
+        req_params: dict[str, Any] = {
+            "contract": contract, "size": size, "price": "0", "tif": "ioc",
+            "text": text, "settle": "usdt",
+        }
+        if reduce_only:
+            req_params["reduce_only"] = True
+        channel = "futures.order_place"
+        event = "api"
+        # request_private 签名: HMAC-SHA512("{event}\n{channel}\n{json(reqParams)}\n{time}")
+        sign_msg = f"{event}\n{channel}\n{json.dumps(req_params, separators=(',', ':'))}\n{t}"
+        sign = hmac.new(
+            GATE_API_SECRET.encode(), sign_msg.encode(), hashlib.sha512,
+        ).hexdigest()
+        msg = {
+            "id": req_id,
+            "time": t, "channel": channel, "event": event,
+            "payload": {
+                "req_id": req_id,
+                "timestamp": str(t),
+                "api_key": GATE_API_KEY,
+                "signature": sign,
+                "req_param": req_params,
+                "req_header": {"X-Gate-Channel-Id": "ccxt"},
+            },
+        }
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._gate_trade_futures[req_id] = fut
+        self._gate_trade_futures[text] = fut  # fallback 用 text 也能匹配
+        try:
+            t0 = time.perf_counter()
+            t0_sec = int(time.time())
+            await self._gate_trade_ws.send_json(msg)
+            result = await asyncio.wait_for(fut, timeout=15.0)
+            t1 = time.perf_counter()
+            rtt_ms = (t1 - t0) * 1000
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            # Gate order_place 响应含 create_time (秒)，可算成交延迟
+            fill_info = ""
+            if "status" in result:
+                ct = result.get("create_time", 0) or result.get("finish_time", 0)
+                if ct > 0:
+                    fill_ms = int((ct - t0_sec) * 1000)
+                    fill_info = f" | 成交 {fill_ms}ms"
+            logger.info("[延迟] Gate WS 下单 %s %s: 往返 %.0fms%s", symbol, side, rtt_ms, fill_info)
+            # Gate order_place 返回 ack (接单回执)，不含 fill 数据
+            # result 可能是 req_param echo (无 status 字段) 或真实订单对象 (有 status 字段)
+            if "status" in result:
+                filled = abs(float(result.get("size", 0) or 0)) - abs(float(result.get("left", 0) or 0))
+                finished = result.get("status") == "finished"
+            else:
+                # ack 回执模式: IOC 市价单已送达，假设全部成交，由上层调用者 REST 验证
+                filled = precise
+                finished = True
+            return {
+                "id": str(result.get("id", "")), "symbol": symbol, "side": side,
+                "amount": precise, "filled": filled,
+                "status": "closed" if finished else ("partial" if filled > 0 else "open"),
+                "info": result,
+            }
+        except asyncio.TimeoutError:
+            self._gate_trade_futures.pop(req_id, None)
+            self._gate_trade_futures.pop(text, None)
+            raise Exception(f"Gate WS order timeout: {symbol} {side}")
+        except Exception:
+            self._gate_trade_futures.pop(req_id, None)
+            self._gate_trade_futures.pop(text, None)
+            raise
+
+    async def _gate_trade_ws_ping(self) -> None:
+        """Gate 交易 WS 心跳，每 25 秒 ping 一次防止断线。"""
+        while True:
+            await asyncio.sleep(25)
+            ws = getattr(self, "_gate_trade_ws", None)
+            if not ws or ws.closed:
+                break
+            try:
+                await ws.send_json({"time": int(time.time()), "channel": "futures.ping"})
+            except Exception:
+                break
+
+    async def _close_gate_trade_ws(self) -> None:
+        """关闭 Gate 交易 WS，取消所有等待中的订单。"""
+        try:
+            ws = getattr(self, "_gate_trade_ws", None)
+            if ws:
+                await ws.close()
+                self._gate_trade_ws = None
+        except Exception:
+            pass
+        for fut in getattr(self, "_gate_trade_futures", {}).values():
+            if not fut.done():
+                fut.set_exception(Exception("Gate trade WS closed"))
+
+    # ════════════════════════════════════════════════════════════════
+    # 跨交易所开平仓
+    # ════════════════════════════════════════════════════════════════
+
     async def _cross_ensure_leverage(self, exchange: str, symbol: str) -> None:
         """确保合约杠杆已设为 CROSS_LEVERAGE（同币种同倍数只设一次，失败不缓存下次重试）。"""
         key = (exchange, symbol, CROSS_LEVERAGE)
@@ -4256,11 +5201,10 @@ class FundingArbitrageBot:
             self._leverage_set.add(key)
 
     async def _cross_open_short_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """在指定交易所做空合约。"""
-        await self._cross_ensure_leverage(exchange, symbol)
+        """在指定交易所做空合约（杠杆已在 T-10s 狙击阶段预设，此处不再调 REST）。"""
         if exchange == "binance":
             try:
-                order = await self._binance_futures_order(symbol, "sell", amount, position_side="SHORT")
+                order = await self._bn_trade_ws_order(symbol, "sell", amount, position_side="SHORT")
                 return LegResult(True, "futures", symbol, "sell", amount, order=order)
             except Exception as exc:
                 logger.warning("合约开空异常 %s: %s，验证实际持仓...", symbol, exc)
@@ -4276,7 +5220,7 @@ class FundingArbitrageBot:
                 return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
         else:
             try:
-                order = await self._gate_futures_order(symbol, "sell", amount)
+                order = await self._gate_trade_ws_order(symbol, "sell", amount)
                 ok = order.get("status") == "closed"
                 if ok:
                     logger.info("[跨交易所] Gate开空成功 %s: filled=%.4f", symbol, order["filled"])
@@ -4285,15 +5229,22 @@ class FundingArbitrageBot:
                 return LegResult(ok, "futures", symbol, "sell", amount, order=order,
                                  error=None if ok else "Gate short not filled")
             except Exception as exc:
-                logger.error("[跨交易所] Gate开空异常 %s: %s", symbol, exc)
+                logger.warning("[跨交易所] Gate开空异常 %s: %s，验证实际持仓...", symbol, exc)
+                actual = await self._cross_verify_gate_position(symbol)
+                if actual > 0:
+                    logger.warning("Gate开空实际已成交 %s: filled=%.4f (API异常但持仓存在)", symbol, actual)
+                    return LegResult(True, "futures", symbol, "sell", actual,
+                                     order={"id": "verified", "symbol": symbol, "side": "sell",
+                                            "amount": actual, "filled": actual, "status": "closed",
+                                            "info": {"verified_after_error": str(exc)}})
+                logger.error("Gate开空确认失败 %s: %s", symbol, exc)
                 return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
 
     async def _cross_open_long_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """在指定交易所做多合约（开仓前设 1x 杠杆）。"""
-        await self._cross_ensure_leverage(exchange, symbol)
+        """在指定交易所做多合约（杠杆已在 T-10s 狙击阶段预设，此处不再调 REST）。"""
         if exchange == "binance":
             try:
-                order = await self._binance_futures_order(symbol, "buy", amount, position_side="LONG")
+                order = await self._bn_trade_ws_order(symbol, "buy", amount, position_side="LONG")
                 return LegResult(True, "futures", symbol, "buy", amount, order=order)
             except Exception as exc:
                 logger.warning("合约开多异常 %s: %s，验证实际持仓...", symbol, exc)
@@ -4309,7 +5260,7 @@ class FundingArbitrageBot:
                 return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
         else:
             try:
-                order = await self._gate_futures_order(symbol, "buy", amount)
+                order = await self._gate_trade_ws_order(symbol, "buy", amount)
                 ok = order.get("status") == "closed"
                 if ok:
                     logger.info("[跨交易所] Gate开多成功 %s: filled=%.4f", symbol, order["filled"])
@@ -4318,17 +5269,24 @@ class FundingArbitrageBot:
                 return LegResult(ok, "futures", symbol, "buy", amount, order=order,
                                  error=None if ok else "Gate long not filled")
             except Exception as exc:
-                logger.error("[跨交易所] Gate开多异常 %s: %s", symbol, exc)
+                logger.warning("[跨交易所] Gate开多异常 %s: %s，验证实际持仓...", symbol, exc)
+                actual = await self._cross_verify_gate_position(symbol)
+                if actual > 0:
+                    logger.warning("Gate开多实际已成交 %s: filled=%.4f (API异常但持仓存在)", symbol, actual)
+                    return LegResult(True, "futures", symbol, "buy", actual,
+                                     order={"id": "verified", "symbol": symbol, "side": "buy",
+                                            "amount": actual, "filled": actual, "status": "closed",
+                                            "info": {"verified_after_error": str(exc)}})
+                logger.error("Gate开多确认失败 %s: %s", symbol, exc)
                 return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
 
     async def _cross_close_short_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
         """平空单（买入平空）。"""
         if exchange == "binance":
             try:
-                order = await self._binance_futures_order(symbol, "buy", amount, reduce_only=True, position_side="SHORT")
+                order = await self._bn_trade_ws_order(symbol, "buy", amount, reduce_only=True, position_side="SHORT")
                 return LegResult(True, "futures", symbol, "buy", amount, order=order)
             except Exception as exc:
-                # API 返回 filled=0 但可能已成交，验证仓位是否消失
                 remaining = await self._cross_verify_binance_position(symbol, "SHORT")
                 if remaining < amount * 0.1:
                     logger.warning("平空已成交 %s: 仓位已消失 (API返回filled=0)", symbol)
@@ -4340,21 +5298,28 @@ class FundingArbitrageBot:
                 return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
         else:
             try:
-                order = await self._gate_futures_order(symbol, "buy", amount, reduce_only=True)
+                order = await self._gate_trade_ws_order(symbol, "buy", amount, reduce_only=True)
                 ok = order.get("status") == "closed"
                 return LegResult(ok, "futures", symbol, "buy", amount, order=order,
                                  error=None if ok else "Gate close short not filled")
             except Exception as exc:
+                remaining = await self._cross_verify_gate_position(symbol)
+                if remaining < amount * 0.1:
+                    logger.warning("Gate平空已成交 %s: 仓位已消失 (API返回异常)", symbol)
+                    return LegResult(True, "futures", symbol, "buy", amount,
+                                     order={"id": "verified_close", "symbol": symbol, "side": "buy",
+                                            "amount": amount, "filled": amount, "status": "closed",
+                                            "info": {"verified_after_error": str(exc)}})
+                logger.error("Gate平空确认失败 %s: 剩余=%.4f err=%s", symbol, remaining, exc)
                 return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
 
     async def _cross_close_long_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
         """平多单（卖出平多）。"""
         if exchange == "binance":
             try:
-                order = await self._binance_futures_order(symbol, "sell", amount, reduce_only=True, position_side="LONG")
+                order = await self._bn_trade_ws_order(symbol, "sell", amount, reduce_only=True, position_side="LONG")
                 return LegResult(True, "futures", symbol, "sell", amount, order=order)
             except Exception as exc:
-                # API 返回 filled=0 但可能已成交，验证仓位是否消失
                 remaining = await self._cross_verify_binance_position(symbol, "LONG")
                 if remaining < amount * 0.1:
                     logger.warning("平多已成交 %s: 仓位已消失 (API返回filled=0)", symbol)
@@ -4366,11 +5331,19 @@ class FundingArbitrageBot:
                 return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
         else:
             try:
-                order = await self._gate_futures_order(symbol, "sell", amount, reduce_only=True)
+                order = await self._gate_trade_ws_order(symbol, "sell", amount, reduce_only=True)
                 ok = order.get("status") == "closed"
                 return LegResult(ok, "futures", symbol, "sell", amount, order=order,
                                  error=None if ok else "Gate close long not filled")
             except Exception as exc:
+                remaining = await self._cross_verify_gate_position(symbol)
+                if remaining < amount * 0.1:
+                    logger.warning("Gate平多已成交 %s: 仓位已消失 (API返回异常)", symbol)
+                    return LegResult(True, "futures", symbol, "sell", amount,
+                                     order={"id": "verified_close", "symbol": symbol, "side": "sell",
+                                            "amount": amount, "filled": amount, "status": "closed",
+                                            "info": {"verified_after_error": str(exc)}})
+                logger.error("Gate平多确认失败 %s: 剩余=%.4f err=%s", symbol, remaining, exc)
                 return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
 
     async def _cross_calculate_amount(self, exchange: str, symbol: str,
@@ -4400,7 +5373,7 @@ class FundingArbitrageBot:
                                               base: str,
                                               short_ex: str, short_sym: str,
                                               long_ex: str, long_sym: str,
-                                              amount: float,
+                                              short_amount: float, long_amount: float,
                                               short_price: float, long_price: float,
                                               short_rate: float, long_rate: float,
                                               rate_spread: float, net_rate: float,
@@ -4408,29 +5381,34 @@ class FundingArbitrageBot:
                                               long_next_funding_time_ms: float) -> bool:
         """开仓跨交易所套利：并发下空单+多单，设置 cross_state。"""
         logger.info(
-            "[跨交易所] 开仓 %s: %s空@%s(%.4f%%) + %s多@%s(%.4f%%) | 数量=%s | 费率差=%.4f%% | 净收益=%.4f%%",
-            base, base, short_ex, short_rate * 100,
-            base, long_ex, long_rate * 100,
-            amount, rate_spread * 100, net_rate * 100,
+            "[跨交易所] 开仓 %s: %s空@%s(%.4f%%) × %.4f张 + %s多@%s(%.4f%%) × %.4f张 | 费率差=%.4f%% | 净收益=%.4f%%",
+            base, base, short_ex, short_rate * 100, short_amount,
+            base, long_ex, long_rate * 100, long_amount,
+            rate_spread * 100, net_rate * 100,
         )
 
-        short_task = self._cross_open_short_leg(short_ex, short_sym, amount)
-        long_task = self._cross_open_long_leg(long_ex, long_sym, amount)
+        short_task = self._cross_open_short_leg(short_ex, short_sym, short_amount)
+        long_task = self._cross_open_long_leg(long_ex, long_sym, long_amount)
         short_result, long_result = await asyncio.gather(short_task, long_task)
 
         if short_result.ok and long_result.ok:
+            # 用实际成交均价，不用扫描参考价
+            short_fill = self._extract_fill_price(short_result.order)
+            long_fill = self._extract_fill_price(long_result.order)
             self.cross_state = CrossArbitrageState(
                 is_open=True,
                 base=base,
-                amount=amount,
+                amount=short_amount * short_price,  # 近似 USDT 名义值（显示用）
+                short_amount=short_amount,
+                long_amount=long_amount,
                 short_exchange=short_ex,
                 long_exchange=long_ex,
                 short_symbol=short_sym,
                 long_symbol=long_sym,
                 short_order_id=str(short_result.order.get("id", "")),
                 long_order_id=str(long_result.order.get("id", "")),
-                short_entry_price=short_price,
-                long_entry_price=long_price,
+                short_entry_price=short_fill or short_price,
+                long_entry_price=long_fill or long_price,
                 short_rate=short_rate,
                 long_rate=long_rate,
                 rate_spread=rate_spread,
@@ -4444,9 +5422,9 @@ class FundingArbitrageBot:
                 self._send_email,
                 "bazfbot 跨所开仓",
                 f"币种: {base}\n"
-                f"空 {short_ex}: {short_sym} 费率 {short_rate*100:.4f}%\n"
-                f"多 {long_ex}: {long_sym} 费率 {long_rate*100:.4f}%\n"
-                f"数量: {amount} | 费率差: {rate_spread*100:.4f}%\n"
+                f"空 {short_ex}: {short_sym} × {short_amount}张 费率 {short_rate*100:.4f}%\n"
+                f"多 {long_ex}: {long_sym} × {long_amount}张 费率 {long_rate*100:.4f}%\n"
+                f"数量: {short_amount}/{long_amount} | 费率差: {rate_spread*100:.4f}%\n"
                 f"净收益: {net_rate*100:.4f}%",
             )
             return True
@@ -4455,10 +5433,10 @@ class FundingArbitrageBot:
         logger.critical("[跨交易所] 开仓未同时成功: short=%s long=%s", short_result, long_result)
         if short_result.ok:
             logger.critical("[跨交易所] 空单已成交但多单失败，立即平空恢复中性")
-            await self._cross_close_short_leg(short_ex, short_sym, amount)
+            await self._cross_close_short_leg(short_ex, short_sym, short_amount)
         if long_result.ok:
             logger.critical("[跨交易所] 多单已成交但空单失败，立即平多恢复中性")
-            await self._cross_close_long_leg(long_ex, long_sym, amount)
+            await self._cross_close_long_leg(long_ex, long_sym, long_amount)
         return False
 
     async def _close_cross_exchange_position(self) -> bool:
@@ -4471,8 +5449,8 @@ class FundingArbitrageBot:
                      cs.base, cs.short_exchange, cs.short_symbol,
                      cs.long_exchange, cs.long_symbol)
 
-        short_task = self._cross_close_short_leg(cs.short_exchange, cs.short_symbol, cs.amount)
-        long_task = self._cross_close_long_leg(cs.long_exchange, cs.long_symbol, cs.amount)
+        short_task = self._cross_close_short_leg(cs.short_exchange, cs.short_symbol, cs.short_amount)
+        long_task = self._cross_close_long_leg(cs.long_exchange, cs.long_symbol, cs.long_amount)
         short_r, long_r = await asyncio.gather(short_task, long_task)
 
         # 重试失败腿
@@ -4481,17 +5459,16 @@ class FundingArbitrageBot:
                 break
             if not short_r.ok:
                 logger.warning("[跨交易所] 平空失败，重试 %d/3", attempt + 1)
-                short_r = await self._cross_close_short_leg(cs.short_exchange, cs.short_symbol, cs.amount)
+                short_r = await self._cross_close_short_leg(cs.short_exchange, cs.short_symbol, cs.short_amount)
             if not long_r.ok:
                 logger.warning("[跨交易所] 平多失败，重试 %d/3", attempt + 1)
-                long_r = await self._cross_close_long_leg(cs.long_exchange, cs.long_symbol, cs.amount)
-            await asyncio.sleep(1.0)
+                long_r = await self._cross_close_long_leg(cs.long_exchange, cs.long_symbol, cs.long_amount)
+            await asyncio.sleep(0.5)
 
         if short_r.ok and long_r.ok:
             logger.info("[跨交易所] 平仓成功。")
-            short_exit = self._extract_fill_price(short_r.order) if short_r.order else 0.0
-            long_exit = self._extract_fill_price(long_r.order) if long_r.order else 0.0
-            self._record_cross_trade(short_exit=short_exit, long_exit=long_exit)
+            await self._record_cross_trade(short_close_order=short_r.order,
+                                            long_close_order=long_r.order)
             self.cross_state = CrossArbitrageState()
             self._save_cross_state()
             await asyncio.to_thread(
@@ -4503,10 +5480,10 @@ class FundingArbitrageBot:
         logger.critical("[跨交易所] 平仓部分失败！short=%s long=%s", short_r, long_r)
         if short_r.ok and not long_r.ok:
             logger.critical("[跨交易所] 重开多单恢复对冲")
-            await self._cross_open_long_leg(cs.long_exchange, cs.long_symbol, cs.amount)
+            await self._cross_open_long_leg(cs.long_exchange, cs.long_symbol, cs.long_amount)
         elif long_r.ok and not short_r.ok:
             logger.critical("[跨交易所] 重开空单恢复对冲")
-            await self._cross_open_short_leg(cs.short_exchange, cs.short_symbol, cs.amount)
+            await self._cross_open_short_leg(cs.short_exchange, cs.short_symbol, cs.short_amount)
         await asyncio.to_thread(
             self._send_email,
             "bazfbot 跨所平仓失败！",
@@ -4516,93 +5493,164 @@ class FundingArbitrageBot:
 
     @staticmethod
     def _extract_fill_price(order: dict[str, Any] | None) -> float:
-        """从订单响应中提取成交均价。"""
+        """从订单响应中提取成交均价（兼容 Binance + Gate 格式）。"""
         if not order:
             return 0.0
-        for src in (order.get("info", {}), order):
-            avg = src.get("avgPrice")
-            if avg:
-                return float(avg)
-            qq = src.get("cummulativeQuoteQty")
-            eq = src.get("executedQty")
-            if qq and eq:
-                qty = float(eq)
-                if qty > 0:
-                    return float(qq) / qty
+        info = order.get("info", {})
+        # BN: avgPrice / cummulativeQuoteQty
+        for src in (info, order):
+            if isinstance(src, dict):
+                avg = src.get("avgPrice")
+                if avg:
+                    return float(avg)
+                qq = src.get("cummulativeQuoteQty")
+                eq = src.get("executedQty")
+                if qq and eq:
+                    qty = float(eq)
+                    if qty > 0:
+                        return float(qq) / qty
+        # Gate: info.fill_price 直接就是成交均价
+        if isinstance(info, dict) and info.get("fill_price"):
+            return float(info["fill_price"])
+        # 回退：顶级字段
         for key in ("price", "fill_price", "average"):
             if order.get(key):
                 return float(order[key])
         return 0.0
 
-    def _record_cross_trade(self, short_exit: float = 0.0, long_exit: float = 0.0) -> None:
-        """记录跨交易所套利交易到 trade_history。按交易所拆分真实盈亏。"""
+    async def _query_order_actual_fee(self, exchange: str, symbol: str,
+                                       order_id: str,
+                                       close_info: dict | None = None) -> float:
+        """查询实际成交手续费。
+        - Binance: GET /fapi/v1/userTrades?orderId=... 累加 commission
+        - Gate: 优先用 close_info["fee"]，否则 GET /futures/usdt/orders/{id}
+        """
+        if not order_id or order_id in ("", "0", "verified", "verified_close"):
+            return 0.0
+        if exchange == "gate":
+            if close_info:
+                fee = float(close_info.get("fee", 0) or 0)
+                if fee > 0:
+                    return fee
+            try:
+                resp = await self._gate_request(f"/futures/usdt/orders/{order_id}")
+                return float(resp.get("fee", 0) or 0)
+            except Exception:
+                return 0.0
+        # Binance
+        try:
+            clean = self._clean_futures_symbol(symbol)
+            trades = await self._binance_request(
+                BINANCE_FUTURES_API, "/fapi/v1/userTrades",
+                {"symbol": clean, "orderId": int(order_id)},
+            )
+            total = 0.0
+            for t in (trades if isinstance(trades, list) else []):
+                total += abs(float(t.get("commission", 0) or 0))
+            return total
+        except Exception:
+            return 0.0
+
+    async def _record_cross_trade(self, short_close_order: dict | None = None,
+                                   long_close_order: dict | None = None) -> None:
+        """平仓后从交易所查询实际资费+手续费+成交价，不做估算。"""
         cs = self.cross_state
-        if not cs.is_open or cs.amount <= 0:
+        if not cs.is_open or cs.short_amount <= 0 or cs.long_amount <= 0:
             return
-        amount = cs.amount
+        short_amount = cs.short_amount
+        long_amount = cs.long_amount
         short_entry = cs.short_entry_price
         long_entry = cs.long_entry_price
-        short_notional = amount * short_entry if short_entry else 0
-        long_notional = amount * long_entry if long_entry else 0
+        short_notional = short_amount * short_entry if short_entry else 0
+        long_notional = long_amount * long_entry if long_entry else 0
 
-        # 费率、抵扣、返佣查找表
+        # 提取平仓成交价
+        short_exit = self._extract_fill_price(short_close_order) if short_close_order else 0.0
+        long_exit = self._extract_fill_price(long_close_order) if long_close_order else 0.0
+
+        # ── 查实际手续费（4 单并发：开空+平空+开多+平多）──
+        short_close_id = str(short_close_order.get("id", "")) if short_close_order else ""
+        long_close_id = str(long_close_order.get("id", "")) if long_close_order else ""
+        short_close_info = short_close_order.get("info") if short_close_order else None
+        long_close_info = long_close_order.get("info") if long_close_order else None
+
+        s_open_fee, s_close_fee, l_open_fee, l_close_fee = await asyncio.gather(
+            self._query_order_actual_fee(cs.short_exchange, cs.short_symbol, cs.short_order_id or ""),
+            self._query_order_actual_fee(cs.short_exchange, cs.short_symbol, short_close_id, short_close_info),
+            self._query_order_actual_fee(cs.long_exchange, cs.long_symbol, cs.long_order_id or ""),
+            self._query_order_actual_fee(cs.long_exchange, cs.long_symbol, long_close_id, long_close_info),
+        )
+        short_fee_actual = round(s_open_fee + s_close_fee, 6)
+        long_fee_actual = round(l_open_fee + l_close_fee, 6)
+
+        # 费率估算（仅当交易所查询失败时回退）
         bn_fee, gt_fee = getattr(self, "_dash_cross_fees", (0.00045, 0.00018))
         _fee_of = {"binance": bn_fee, "gate": gt_fee}
         _dsc_of = {"binance": BN_FEE_DISCOUNT_FACTOR, "gate": GT_FEE_DISCOUNT_FACTOR}
         _rbt_of = {"binance": BN_FEE_REBATE_FACTOR, "gate": GT_FEE_REBATE_FACTOR}
+        if short_fee_actual <= 0:
+            short_fee_est = round(short_notional * _fee_of.get(cs.short_exchange, bn_fee) * 2, 6)
+            short_fee_actual = round(short_fee_est * _dsc_of.get(cs.short_exchange, 1.0) * _rbt_of.get(cs.short_exchange, 1.0), 6)
+        if long_fee_actual <= 0:
+            long_fee_est = round(long_notional * _fee_of.get(cs.long_exchange, gt_fee) * 2, 6)
+            long_fee_actual = round(long_fee_est * _dsc_of.get(cs.long_exchange, 1.0) * _rbt_of.get(cs.long_exchange, 1.0), 6)
 
-        short_fee_rate = _fee_of.get(cs.short_exchange, bn_fee)
-        long_fee_rate = _fee_of.get(cs.long_exchange, gt_fee)
+        # ── 查实际资费（BN income API / Gate WS 监听结果）──
+        short_actual_funding = 0.0
+        long_actual_funding = 0.0
+        if cs.short_exchange == "binance":
+            short_actual_funding = await self._query_bn_funding_amount(
+                cs.short_symbol, int(cs.short_next_funding_time_ms))
+        elif cs.short_exchange == "gate":
+            short_actual_funding = self._gate_funding_amount
+        if cs.long_exchange == "binance":
+            long_actual_funding = await self._query_bn_funding_amount(
+                cs.long_symbol, int(cs.long_next_funding_time_ms))
+        elif cs.long_exchange == "gate":
+            long_actual_funding = self._gate_funding_amount
 
-        # ── 做空侧（高费率所）──
-        short_price_pnl = round(amount * (short_entry - short_exit), 6)
-        short_funding_pnl = round(short_notional * cs.short_rate, 6)
-        short_fee_gross = round(short_notional * short_fee_rate * 2, 6)
-        short_fee_actual = round(short_fee_gross
-                                 * _dsc_of.get(cs.short_exchange, 1.0)
-                                 * _rbt_of.get(cs.short_exchange, 1.0), 6)
+        # ── 做空侧 PnL ──
+        short_price_pnl = round(short_amount * (short_entry - short_exit), 6)
+        short_funding_pnl = round(short_actual_funding, 6) if short_actual_funding else round(short_notional * cs.short_rate, 6)
         short_net = round(short_price_pnl + short_funding_pnl - short_fee_actual, 6)
 
-        # ── 做多侧（低费率所）──
-        long_price_pnl = round(amount * (long_exit - long_entry), 6)
-        long_funding_pnl = round(-long_notional * cs.long_rate, 6)
-        long_fee_gross = round(long_notional * long_fee_rate * 2, 6)
-        long_fee_actual = round(long_fee_gross
-                                * _dsc_of.get(cs.long_exchange, 1.0)
-                                * _rbt_of.get(cs.long_exchange, 1.0), 6)
+        # ── 做多侧 PnL ──
+        long_price_pnl = round(long_amount * (long_exit - long_entry), 6)
+        long_funding_pnl = round(-long_actual_funding, 6) if long_actual_funding else round(-long_notional * cs.long_rate, 6)
         long_net = round(long_price_pnl + long_funding_pnl - long_fee_actual, 6)
 
         net_pnl = round(short_net + long_net, 6)
 
         self._write_cross_trade_record(
             cs.base, f"cross({cs.short_exchange}空+{cs.long_exchange}多)",
-            cs.amount, cs.short_entry_price, cs.total_net_rate, cs.rate_spread,
+            cs.short_amount, cs.short_entry_price, cs.total_net_rate, cs.rate_spread,
             short_entry=short_entry, short_exit=short_exit,
             long_entry=long_entry, long_exit=long_exit,
             net_pnl=net_pnl,
             short_exchange=cs.short_exchange, short_price_pnl=short_price_pnl,
             short_funding_pnl=short_funding_pnl,
-            short_fee=short_fee_gross, short_actual_fee=short_fee_actual, short_net=short_net,
+            short_fee=short_fee_actual, short_net=short_net,
             long_exchange=cs.long_exchange, long_price_pnl=long_price_pnl,
             long_funding_pnl=long_funding_pnl,
-            long_fee=long_fee_gross, long_actual_fee=long_fee_actual, long_net=long_net)
+            long_fee=long_fee_actual, long_net=long_net)
 
     def _write_cross_trade_record(self, coin: str, direction: str, amount: float,
                                    entry_price: float, net_rate: float, rate_spread: float,
                                    **extra) -> None:
-        """写入一条跨所交易记录。extra 支持 sniper 模式的详细盈亏字段。"""
+        """写入一条跨所交易记录。profit_usdt 优先用真实 net_pnl。"""
         try:
             history = self._load_trade_history()
+            real_pnl = extra.get("net_pnl")
             record = {
                 "time": datetime.now(tz=self.tz).strftime("%Y-%m-%d %H:%M:%S"),
                 "coin": coin,
                 "direction": direction,
-                "profit_usdt": round(amount * entry_price * net_rate, 6),
+                "profit_usdt": round(real_pnl, 6) if real_pnl is not None else round(amount * entry_price * net_rate, 6),
                 "net_rate": net_rate,
                 "rate_spread": rate_spread,
                 "amount": amount,
             }
-            record.update({k: v for k, v in extra.items() if v})  # 合并额外字段
+            record.update({k: v for k, v in extra.items() if v is not None})  # 保留零值
             history.append(record)
             with self.TRADE_HISTORY_FILE.open("w", encoding="utf-8") as f:
                 json.dump(history[-500:], f, indent=2, ensure_ascii=False)
@@ -4627,7 +5675,7 @@ class FundingArbitrageBot:
         if not cs.is_open:
             return False
 
-        async def _check_futures_pos(exchange: str, symbol: str, expect_short: bool) -> tuple[bool, str]:
+        async def _check_futures_pos(exchange: str, symbol: str, expect_short: bool, expect_amount: float) -> tuple[bool, str]:
             """检查指定交易所是否有对应方向的合约持仓。返回 (ok, detail)。"""
             if exchange == "binance":
                 try:
@@ -4646,7 +5694,7 @@ class FundingArbitrageBot:
                             if not expect_short and ps != "LONG":
                                 continue
                             amt = abs(float(pos.get("positionAmt", 0) or 0))
-                            if amt >= cs.amount * 0.1:
+                            if amt >= expect_amount * 0.1:
                                 detail = f"positionAmt={amt} side={ps}"
                                 return True, detail
                         return False, f"no matching positionSide in {len(resp)} positions"
@@ -4658,12 +5706,12 @@ class FundingArbitrageBot:
                 try:
                     positions = await self._safe_request(
                         f"verify_pos_gate",
-                        lambda: self.gate_futures.fetch_positions([symbol]),
+                        lambda: self._fetch_gate_positions_direct(symbol),
                         default=[],
                     )
                     for pos in positions:
                         contracts = float(pos.get("contracts", 0) or 0)
-                        if abs(contracts) < cs.amount * 0.1:
+                        if abs(contracts) < expect_amount * 0.1:
                             continue
                         if expect_short:
                             return contracts < 0, f"contracts={contracts}"
@@ -4675,8 +5723,8 @@ class FundingArbitrageBot:
                     return True, f"API error, assume exists: {exc}"
 
         short_ok, long_ok = await asyncio.gather(
-            _check_futures_pos(cs.short_exchange, cs.short_symbol, expect_short=True),
-            _check_futures_pos(cs.long_exchange, cs.long_symbol, expect_short=False),
+            _check_futures_pos(cs.short_exchange, cs.short_symbol, expect_short=True, expect_amount=cs.short_amount),
+            _check_futures_pos(cs.long_exchange, cs.long_symbol, expect_short=False, expect_amount=cs.long_amount),
         )
         logger.info("[跨交易所] 持仓验证: short(%s)=%s(%s) long(%s)=%s(%s)",
                     cs.short_exchange, short_ok[0], short_ok[1],
@@ -4693,11 +5741,12 @@ class FundingArbitrageBot:
         # 应急：不管验证结果，两腿都尝试平仓，杜绝裸仓
         logger.critical("[跨交易所] 单腿持仓异常！short_ok=%s long_ok=%s → 尝试平两腿",
                         short_ok, long_ok)
-        await asyncio.gather(
-            self._cross_close_short_leg(cs.short_exchange, cs.short_symbol, cs.amount),
-            self._cross_close_long_leg(cs.long_exchange, cs.long_symbol, cs.amount),
+        s_close_r, l_close_r = await asyncio.gather(
+            self._cross_close_short_leg(cs.short_exchange, cs.short_symbol, cs.short_amount),
+            self._cross_close_long_leg(cs.long_exchange, cs.long_symbol, cs.long_amount),
         )
-        self._record_cross_trade()
+        await self._record_cross_trade(short_close_order=s_close_r.order,
+                                        long_close_order=l_close_r.order)
         self.cross_state = CrossArbitrageState()
         self._save_cross_state()
         return False
@@ -4712,9 +5761,9 @@ class FundingArbitrageBot:
         lines.append(f"  ═══════════════════════════════════════════════════════════════════════════════════════════")
         lines.append(f"  跨交易所资金费率套利 (纯期货多空对冲)  —  每腿 ≈{est_profit:.0f} USDT")
         lines.append(f"  ═══════════════════════════════════════════════════════════════════════════════════════════")
-        header = (f"  {'币种':<8s} {'BN价':>10s} {'GT价':>10s} {'费率差':>7s} {'净收益':>7s} "
-                  f"{'做空所':>6s} {'空费率':>7s} {'空结算':>7s} "
-                  f"{'做多所':>6s} {'多费率':>7s} {'多结算':>7s}")
+        header = (f"  {'':1s}{'币种':<8s} {'BN价':>10s} {'GT价':>10s} {'费率差':>7s} {'净收益':>7s} "
+                  f"{'做空所':>7s} {'空费率':>8s} {'空结算':>7s} "
+                  f"{'做多所':>7s} {'多费率':>8s} {'多结算':>7s}")
         lines.append(header)
         lines.append("  " + "-" * 110)
         now_ms = time.time() * 1000
@@ -4733,8 +5782,8 @@ class FundingArbitrageBot:
             long_wait = f"{int(long_m)}m" if long_m >= 0 else "N/A"
             lines.append(
                 f"  {mark}{str(r['base']):<8s} {bn_p:>10.6f} {gt_p:>10.6f} {float(r['rate_spread'])*100:>6.4f}% {float(r['net_rate'])*100:>6.4f}% "
-                f"{str(r['short_exchange']):>6s} {float(r['short_rate'])*100:>7.4f}% {short_wait:>7s} "
-                f"{str(r['long_exchange']):>6s} {float(r['long_rate'])*100:>7.4f}% {long_wait:>7s}"
+                f"{str(r['short_exchange']):>7s} {float(r['short_rate'])*100:>7.4f}% {short_wait:>7s} "
+                f"{str(r['long_exchange']):>7s} {float(r['long_rate'])*100:>7.4f}% {long_wait:>7s}"
             )
         passes_any = any(r.get("passes", False) for _, r in df.head(20).iterrows())
         if has_col and not passes_any:
@@ -4751,7 +5800,7 @@ class FundingArbitrageBot:
         try:
             positions = await self._safe_request(
                 "gate_futures.fetch_positions_x",
-                lambda: self.gate_futures.fetch_positions([symbol]),
+                lambda: self._fetch_gate_positions_direct(symbol),
                 default=[],
             )
             for pos in positions:
@@ -4784,7 +5833,8 @@ class FundingArbitrageBot:
         est_profit = notional * cs.total_net_rate if notional > 0 else 0
 
         logger.info("  ═══════════════════════════════════════════════════════════════")
-        logger.info("  跨交易所持仓  —  %s × %.4f 张  (每腿≈%.0f USDT)", cs.base, cs.amount, notional)
+        logger.info("  跨交易所持仓  —  %s 空×%.4f张 多×%.4f张  (≈%.0f USDT/腿)",
+                     cs.base, cs.short_amount, cs.long_amount, notional)
         logger.info("  ═══════════════════════════════════════════════════════════════")
         logger.info("    做空: %6s  %-12s  费率=%+7.4f%%  结算: %s",
                      cs.short_exchange.upper(), cs.short_symbol, cs.short_rate * 100, short_settle)
@@ -4809,7 +5859,7 @@ class FundingArbitrageBot:
             )
             gt_positions = await self._safe_request(
                 "orphan_gt_positions",
-                lambda: self.gate_futures.fetch_positions(),
+                lambda: self._fetch_gate_positions_direct(),
                 default=[],
             )
 
@@ -4965,14 +6015,14 @@ class FundingArbitrageBot:
             return
 
         # ── 无持仓：狙击模式 ──
-        # T-5s 扫描获取最新费率 → T-250ms 直接开仓
+        # T-10s 扫描获取最新费率+设杠杆 → T-1s 直接开仓
         snipe_ms = getattr(self, "_next_snipe_settle_ms", 0)
         if snipe_ms:
             remain_ms = snipe_ms - time.time() * 1000
             if remain_ms <= 0:
                 self._next_snipe_settle_ms = 0
             elif remain_ms <= CROSS_SNIPE_WINDOW_SEC * 1000:
-                # Step 1: sleep 到 T-5s，扫描
+                # Step 1: T-10s 扫描+设杠杆
                 scan_at_ms = snipe_ms - CROSS_SNIPER_SCAN_OFFSET_SEC * 1000
                 await asyncio.sleep(max(0, (scan_at_ms - time.time() * 1000) / 1000))
                 logger.info("[跨交易所] 狙击扫描：距结算 %dms",
@@ -4986,7 +6036,17 @@ class FundingArbitrageBot:
                     self._next_snipe_settle_ms = 0
                     return
                 position_usdt = min(bn_bal, gt_bal) * CROSS_POSITION_SIZE_RATIO
-                cross_df = await self._scan_cross_exchange(position_usdt, strict=True)
+                # 清 Gate tickers 5s 缓存，确保狙击用最新价格
+                self._gate_ft_cache = {}
+                # 狙击扫描 12s 超时保护，超时回退主扫缓存
+                try:
+                    cross_df = await asyncio.wait_for(
+                        self._scan_cross_exchange(position_usdt, strict=True, snipe=True),
+                        timeout=12,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[跨交易所] 狙击扫描超时，回退主扫缓存数据")
+                    cross_df = getattr(self, "_dash_cross_df", pd.DataFrame())
                 self._dash_cross_df = cross_df
                 passing = cross_df[cross_df["passes"] == True] if not cross_df.empty and "passes" in cross_df.columns else cross_df
                 if passing.empty:
@@ -5023,15 +6083,16 @@ class FundingArbitrageBot:
                 c_long_bal = bn_bal if c_long_ex == "binance" else gt_bal
                 c_short_notional = c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
                 c_long_notional = c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
-                c_short_qty = await self._cross_calculate_amount(c_short_ex, c_short_sym, c_short_price, c_short_notional)
-                c_long_qty = await self._cross_calculate_amount(c_long_ex, c_long_sym, c_long_price, c_long_notional)
+                # 取较小名义金额确保双边等名义值（不同交易所 contractSize 不同，不能 min 张数）
+                c_min_notional = min(c_short_notional, c_long_notional)
+                c_short_qty = await self._cross_calculate_amount(c_short_ex, c_short_sym, c_short_price, c_min_notional)
+                c_long_qty = await self._cross_calculate_amount(c_long_ex, c_long_sym, c_long_price, c_min_notional)
                 if c_short_qty <= 0 or c_long_qty <= 0:
                     logger.error("[跨交易所] 狙击数量计算失败")
                     self._next_snipe_settle_ms = 0
                     return
-                c_amount = min(c_short_qty, c_long_qty)
-                est_short = c_amount * c_short_price
-                est_long = c_amount * c_long_price
+                est_short = c_min_notional  # 双边等名义 USDT
+                est_long = c_min_notional
                 if est_short > c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1 or \
                    est_long > c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1:
                     logger.error("[跨交易所] 狙击数量超限: short≈%.2f long≈%.2f", est_short, est_long)
@@ -5041,8 +6102,13 @@ class FundingArbitrageBot:
                     logger.warning("[跨交易所] 狙击仓位太小: short≈%.2f long≈%.2f USDT，跳过", est_short, est_long)
                     self._next_snipe_settle_ms = 0
                     return
+                # 提前设杠杆，省去开仓时 API 调用延迟 (~66ms)
+                await asyncio.gather(
+                    self._cross_ensure_leverage(c_short_ex, c_short_sym),
+                    self._cross_ensure_leverage(c_long_ex, c_long_sym),
+                )
 
-                # Step 2: sleep 到 T-250ms，开仓
+                # Step 2: T-1s 只管发单
                 open_at_ms = snipe_ms - CROSS_SNIPER_OPEN_OFFSET_MS
                 await asyncio.sleep(max(0, (open_at_ms - time.time() * 1000) / 1000))
                 logger.info("[跨交易所] 狙击开仓 %s: 距结算 %dms",
@@ -5051,7 +6117,7 @@ class FundingArbitrageBot:
                     base=c_base,
                     short_ex=c_short_ex, short_sym=c_short_sym,
                     long_ex=c_long_ex, long_sym=c_long_sym,
-                    amount=c_amount,
+                    short_amount=c_short_qty, long_amount=c_long_qty,
                     short_price=c_short_price, long_price=c_long_price,
                     short_rate=c_short_rate, long_rate=c_long_rate,
                     rate_spread=c_rate_spread, net_rate=c_net_rate,
@@ -5060,10 +6126,57 @@ class FundingArbitrageBot:
                 )
                 if ok:
                     settle_ms = max(c_short_nft, c_long_nft)
-                    wait_ms = settle_ms - time.time() * 1000
-                    if wait_ms > 0:
-                        await asyncio.sleep(wait_ms / 1000)
-                    await self._close_cross_exchange_position()
+                    try:
+                        # 设置 Gate 监听目标 + REST 查询基线 pnl_fund
+                        gt_sym = c_short_sym if c_short_ex == "gate" else c_long_sym
+                        self._gate_funding_symbol = gt_sym
+                        self._gate_funding_baseline = 0.0
+                        await self._gate_subscribe_position(gt_sym)
+                        try:
+                            existing = await self._safe_request(
+                                "gate_funding_baseline",
+                                lambda: self._fetch_gate_positions_direct(gt_sym),
+                                default=[],
+                            )
+                            for pos in existing:
+                                if pos.get("symbol") == gt_sym:
+                                    self._gate_funding_baseline = float(pos.get("info", {}).get("pnl_fund", 0) or 0)
+                                    break
+                        except Exception:
+                            pass
+                        logger.info("[资费监听] Gate 目标 %s baseline=%.4f", gt_sym, self._gate_funding_baseline)
+                        # 清除双 WS 事件标记
+                        self._funding_event.clear()
+                        self._gate_funding_event.clear()
+                        # 等到结算时刻
+                        await asyncio.sleep(max(0, (settle_ms - time.time() * 1000) / 1000))
+                        t_settle = time.perf_counter()
+                        logger.info("[延迟] 到达结算时刻，开始等 WS 推送")
+                        # 真正异步等双 WS 推送（set 瞬间唤醒，0 轮询延迟，最多 10s）
+                        bn_t = asyncio.create_task(self._funding_event.wait())
+                        gt_t = asyncio.create_task(self._gate_funding_event.wait())
+                        await asyncio.wait([bn_t, gt_t], timeout=10.0)
+                        t_event = time.perf_counter()
+                        bn_ok = self._funding_event.is_set()
+                        gt_ok = self._gate_funding_event.is_set()
+                        ws_latency_ms = (t_event - t_settle) * 1000
+                        logger.info("[延迟] WS 推送检测耗时: %.1fms (BN=%s GT=%s)", ws_latency_ms, bn_ok, gt_ok)
+                        # WS 未收到的用 REST 兜底
+                        if not bn_ok:
+                            bn_sym = c_short_sym if c_short_ex == "binance" else c_long_sym
+                            bn_ok = await self._check_bn_funding_received(bn_sym, settle_ms)
+                        if not gt_ok:
+                            gt_ok = await self._check_gate_funding_received(gt_sym)
+                        logger.info("[资费监听] 确认完成: BN=%s GT=%s", bn_ok, gt_ok)
+                        if not bn_ok or not gt_ok:
+                            logger.warning("[资费监听] 未全部确认，强制平仓")
+                    except Exception as exc:
+                        logger.critical("[跨交易所] 等待资费异常: %s，直接平仓", exc)
+                    finally:
+                        t_close_start = time.perf_counter()
+                        await self._close_cross_exchange_position()
+                        t_close_end = time.perf_counter()
+                        logger.info("[延迟] 平仓执行耗时: %.1fms", (t_close_end - t_close_start) * 1000)
                 self._next_snipe_settle_ms = 0
                 await self._update_cross_dashboard(bn_bal, gt_bal)
                 return
@@ -5112,6 +6225,18 @@ class FundingArbitrageBot:
                 self._next_snipe_settle_ms = 0
 
         self._print_cross_opportunity_table(cross_df, position_usdt)
+
+        # 若刚发现机会且结算在 20s 内 → 直接跳狙击，不再等下一轮
+        if not getattr(self, "_snipe_loop_guard", False) and self._next_snipe_settle_ms:
+            remain_ms = self._next_snipe_settle_ms - time.time() * 1000
+            if 0 < remain_ms <= CROSS_SNIPE_WINDOW_SEC * 1000 * 2:
+                logger.info("[跨交易所] 距结算仅 %dms，直接进入狙击流程", int(remain_ms))
+                self._snipe_loop_guard = True
+                try:
+                    await self._run_cross_exchange_cycle(False)
+                finally:
+                    self._snipe_loop_guard = False
+                return
 
     async def _update_cross_dashboard(self, bn_fut_bal: float, gt_fut_bal: float) -> None:
         """在跨所模式下填充看板余额变量。"""
@@ -5678,7 +6803,6 @@ class FundingArbitrageBot:
         )
         return True
 
-    @staticmethod
     def _print_position_summary(self, exchange: str = "binance") -> None:
         state = self.gate_state if exchange == "gate" else self.binance_state
         if not state.is_open:
@@ -5727,17 +6851,21 @@ class FundingArbitrageBot:
                     await asyncio.sleep(5)  # 无持仓时低频率
 
         async def main_loop():
+            first_run = True
             while True:
-                sleep_seconds = self._seconds_until_next_wakeup()
-                wakeup_at = datetime.now(tz=self.tz) + timedelta(seconds=sleep_seconds)
-                has_pos = await self.has_open_arbitrage_position()
-                logger.info(
-                    "┗━━ 主扫结束 | 休眠 %.0f 分钟, 下次: %s (%s持仓)",
-                    sleep_seconds / 60,
-                    wakeup_at.strftime("%m-%d %H:%M:%S"),
-                    "有" if has_pos else "无",
-                )
-                await asyncio.sleep(sleep_seconds)
+                if not first_run:
+                    sleep_seconds = self._seconds_until_next_wakeup()
+                    wakeup_at = datetime.now(tz=self.tz) + timedelta(seconds=sleep_seconds)
+                    has_pos = await self.has_open_arbitrage_position()
+                    logger.info(
+                        "┗━━ 主扫结束 | 休眠 %.0f 分钟, 下次: %s (%s持仓)",
+                        sleep_seconds / 60,
+                        wakeup_at.strftime("%m-%d %H:%M:%S"),
+                        "有" if has_pos else "无",
+                    )
+                    await asyncio.sleep(sleep_seconds)
+                else:
+                    first_run = False
                 async with self._scan_lock:
                     await self.run_once()
 
@@ -5869,21 +6997,18 @@ class FundingArbitrageBot:
         # 累计分项：平仓盈亏 / 资费 / 手续费
         cum_price = 0.0
         cum_funding = 0.0
-        cum_fee_gross = 0.0
-        cum_fee_actual = 0.0
+        cum_fee = 0.0
         for h in history:
             if "short_exchange" in h:
                 cum_price += (h.get("short_price_pnl", 0) or 0) + (h.get("long_price_pnl", 0) or 0)
                 cum_funding += (h.get("short_funding_pnl", 0) or 0) + (h.get("long_funding_pnl", 0) or 0)
                 sf = (h.get("short_actual_fee") or h.get("short_fee")) or 0
                 lf = (h.get("long_actual_fee") or h.get("long_fee")) or 0
-                cum_fee_actual += sf + lf
-                cum_fee_gross += (h.get("short_fee", 0) or 0) + (h.get("long_fee", 0) or 0)
+                cum_fee += sf + lf
             elif "price_pnl" in h:
                 cum_price += (h.get("price_pnl", 0) or 0)
                 cum_funding += (h.get("funding_pnl", 0) or 0)
-                cum_fee_actual += (h.get("fee_total", 0) or 0)
-                cum_fee_gross += (h.get("fee_total", 0) or 0)
+                cum_fee += (h.get("fee_total", 0) or 0)
 
         # 月度盈亏：按日期汇总（使用真实净盈亏）
         month_pnl: dict[str, float] = {}
@@ -5926,47 +7051,44 @@ class FundingArbitrageBot:
                     snaps = json.load(f)
             except (OSError, json.JSONDecodeError):
                 pass
-        curve_labels, curve_data = [], []
+        curve_labels, curve_total, curve_bn, curve_gt = [], [], [], []
         if snaps:
             step = max(1, len(snaps) // 200)
-            # 智能时间格式：同一天只显示 HH:MM，跨天显示 MM-DD HH:MM
             first_date = snaps[0].get("ts", "")[:10]
             last_date = snaps[-1].get("ts", "")[:10]
             same_day = first_date == last_date
             for s in snaps[::step]:
                 ts = s.get("ts", "")
                 if same_day:
-                    label = ts[11:16]  # HH:MM
+                    label = ts[11:16]
                 else:
-                    label = ts[5:16].replace("T", " ")  # MM-DD HH:MM
+                    label = ts[5:16].replace("T", " ")
+                bn_v = s.get("binance", 0)
+                gt_v = s.get("gate", 0)
                 curve_labels.append(label)
-                curve_data.append(round(s.get("binance", 0) + s.get("gate", 0), 2))
+                curve_total.append(round(bn_v + gt_v, 2))
+                curve_bn.append(round(bn_v, 2))
+                curve_gt.append(round(gt_v, 2))
 
         # ── 月历数据（JS 动态渲染）──
         pnl_json = json.dumps(month_pnl, ensure_ascii=False)
         today_iso = now.strftime("%Y-%m-%d")
 
         # ── 余额卡片 ──
-        grand_total = total_usdt + gate_spot
-        gate_cards = ""
+        grand_total = futures_usdt + (gate_spot if GATE_TRADING_ENABLED else 0)
+        gate_card = ""
         if GATE_TRADING_ENABLED:
-            gate_cards = f"""
-            <div class="card"><div class="label">Gate 交易</div><div class="value" style="color:#17c9a4">{gate_spot:,.2f}</div></div>
-            <div class="card total"><div class="label">总计</div><div class="value" style="color:#f0b90b">{grand_total:,.2f}</div></div>"""
-        else:
-            gate_cards = f"""
-            <div class="card total"><div class="label">总计</div><div class="value" style="color:#f0b90b">{grand_total:,.2f}</div></div>"""
+            gate_card = f"""<div class="card"><div class="label">Gate 交易</div><div class="value" style="color:#2955E7">{gate_spot:,.2f}</div></div>
+            """
         balance_cards = f"""
         <div class="balances">
-            <div class="card"><div class="label">BN 合约</div><div class="value">{futures_usdt:,.2f}</div></div>
-            <div class="card"><div class="label">BN 合计</div><div class="value">{total_usdt:,.2f}</div></div>
-            {gate_cards}
+            <div class="card"><div class="label">BN 合约</div><div class="value" style="color:#f0b90b">{futures_usdt:,.2f}</div></div>
+            {gate_card}<div class="card"><div class="label">总计</div><div class="value" style="color:#e0e0e0">{grand_total:,.2f}</div></div>
             <div class="card"><div class="label">累计盈亏</div><div class="value {profit_cls}">{total_profit:+.4f}</div></div>
             <div class="card"><div class="label">今日盈亏</div><div class="value {today_cls}">{today_pnl:+.4f}</div></div>
             <div class="card"><div class="label">平仓盈亏</div><div class="value {"positive" if cum_price>=0 else "negative"}">{cum_price:+.4f}</div></div>
             <div class="card"><div class="label">累计资费</div><div class="value {"positive" if cum_funding>=0 else "negative"}">{cum_funding:+.4f}</div></div>
-            <div class="card"><div class="label">手续费(标称)</div><div class="value negative">{cum_fee_gross:.4f}</div></div>
-            <div class="card"><div class="label">手续费(实付)</div><div class="value negative">{cum_fee_actual:.4f}</div></div>
+            <div class="card"><div class="label">手续费</div><div class="value negative">{cum_fee:.4f}</div></div>
         </div>"""
 
         # ── 当前持仓 ──
@@ -6008,7 +7130,7 @@ class FundingArbitrageBot:
             cross_html = ""
             if self.cross_state.is_open:
                 cs = self.cross_state
-                cs_notional = cs.amount * cs.short_entry_price
+                cs_notional = cs.short_amount * cs.short_entry_price if cs.short_entry_price > 0 else cs.amount
                 cs_est = cs_notional * cs.total_net_rate
                 hold_str = ""
                 if cs.opened_at:
@@ -6030,7 +7152,7 @@ class FundingArbitrageBot:
             <h3>🌐 跨交易所套利 <span class="muted" style="font-size:0.7rem">{hold_str}</span></h3>
             <div class="position cross" style="border:2px solid #f0b90b; background:linear-gradient(135deg,#1a2a1a,#1a1a2a)">
                 <strong>{cs.base}</strong>
-                <span>数量: {cs.amount:.4f} (每腿)</span>
+                <span>数量: 空{cs.short_amount:.4f}张 / 多{cs.long_amount:.4f}张</span>
                 <span>费率差: <span class="positive">{cs.rate_spread*100:+.4f}%</span></span>
                 <span>预估利润: <span class="{'positive' if cs_est > 0 else 'negative'}">{cs_est:+.4f} USDT</span></span>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
@@ -6074,8 +7196,11 @@ class FundingArbitrageBot:
         {pre_borrow_html}"""
 
         # ── 资金曲线 ──
-        curve_json = json.dumps(curve_data, ensure_ascii=False) if curve_data else "[]"
-        labels_json = json.dumps(curve_labels, ensure_ascii=False) if curve_labels else "[]"
+        has_curve = bool(curve_labels)
+        labels_json = json.dumps(curve_labels, ensure_ascii=False) if has_curve else "[]"
+        total_json = json.dumps(curve_total, ensure_ascii=False) if has_curve else "[]"
+        bn_json = json.dumps(curve_bn, ensure_ascii=False) if has_curve else "[]"
+        gt_json = json.dumps(curve_gt, ensure_ascii=False) if has_curve else "[]"
 
         # ── 月历（JS 动态）──
         calendar_html = f"""
@@ -6112,13 +7237,11 @@ class FundingArbitrageBot:
                     long_ex = h.get("long_exchange", "")
                     sp = h.get("short_price_pnl", 0) or 0
                     sf = h.get("short_funding_pnl", 0) or 0
-                    sfe = h.get("short_fee", 0) or 0
-                    sfa = h.get("short_actual_fee") or sfe  # 兼容旧记录
+                    sfee = (h.get("short_actual_fee") or h.get("short_fee")) or 0
                     sn = h.get("short_net", 0) or 0
                     lp = h.get("long_price_pnl", 0) or 0
                     lf = h.get("long_funding_pnl", 0) or 0
-                    lfe = h.get("long_fee", 0) or 0
-                    lfa = h.get("long_actual_fee") or lfe
+                    lfee = (h.get("long_actual_fee") or h.get("long_fee")) or 0
                     ln = h.get("long_net", 0) or 0
                     s_exit = h.get("short_exit") or 0
                     l_exit = h.get("long_exit") or 0
@@ -6133,13 +7256,13 @@ class FundingArbitrageBot:
                              f'<td class="right {pnl_cls}"><b>{net_pnl:+.4f}</b></td></tr>')
                     s_cls = "bn" if short_ex == "binance" else "gt"
                     l_cls = "bn" if long_ex == "binance" else "gt"
-                    # 做空侧: 价格盈亏 / 资费 / 手续费(标称/实付) / 净盈亏
+                    # 做空侧: 价格盈亏 / 资费 / 手续费 / 净盈亏
                     rows += (f'<tr class="cross-sub"><td></td>'
                              f'<td class="right"><span class="badge {s_cls}">{short_ex}空</span></td>'
                              f'<td></td><td class="right"></td>'
                              f'<td class="right {"positive" if sp>=0 else "negative"}">{sp:+.4f}</td>'
                              f'<td class="right {"positive" if sf>=0 else "negative"}">{sf:+.4f}</td>'
-                             f'<td class="right negative">{sfe:.4f}<span class="muted">/{sfa:.4f}</span></td>'
+                             f'<td class="right negative">{sfee:.4f}</td>'
                              f'<td class="right {"positive" if sn>=0 else "negative"}">{sn:+.4f}</td></tr>')
                     # 做多侧
                     rows += (f'<tr class="cross-sub"><td></td>'
@@ -6147,7 +7270,7 @@ class FundingArbitrageBot:
                              f'<td></td><td class="right"></td>'
                              f'<td class="right {"positive" if lp>=0 else "negative"}">{lp:+.4f}</td>'
                              f'<td class="right {"positive" if lf>=0 else "negative"}">{lf:+.4f}</td>'
-                             f'<td class="right negative">{lfe:.4f}<span class="muted">/{lfa:.4f}</span></td>'
+                             f'<td class="right negative">{lfee:.4f}</td>'
                              f'<td class="right {"positive" if ln>=0 else "negative"}">{ln:+.4f}</td></tr>')
                 elif "price_pnl" in h:
                     # 旧版跨所记录（无拆分）：直接展示汇总
@@ -6171,7 +7294,7 @@ class FundingArbitrageBot:
                              f'<td class="right">-</td><td class="right">-</td><td class="right">-</td>'
                              f'<td class="right {pnl_cls}">{pnl:+.4f}</td></tr>')
             if has_detailed:
-                header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">数量</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费(标称/实付)</th><th class="right">净盈亏</th></tr>'
+                header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">数量</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费</th><th class="right">净盈亏</th></tr>'
             else:
                 header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">数量</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费</th><th class="right">净盈亏</th></tr>'
             recent_html = f"""
@@ -6311,11 +7434,11 @@ class FundingArbitrageBot:
 
         # ── Chart.js 曲线 ──
         chart_section = ""
-        if curve_data:
+        if has_curve:
             chart_section = f"""
         <div class="section">
-            <h2>资金曲线 <span class="muted">(BN+Gate 总余额)</span></h2>
-            <div style="position:relative;height:280px"><canvas id="equityChart"></canvas></div>
+            <h2>资金曲线</h2>
+            <div style="position:relative;height:320px"><canvas id="equityChart"></canvas></div>
         </div>"""
 
         html = f"""<!DOCTYPE html>
@@ -6324,67 +7447,197 @@ class FundingArbitrageBot:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <meta http-equiv="refresh" content="30">
-<title>bazfbot 套利看板</title>
+<title>ArbiBot · 套利看板</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
+:root {{
+  --bg: #080c14;
+  --surface: #111827;
+  --surface2: #1a2332;
+  --border: #1e2d3d;
+  --text: #c8d6e5;
+  --text2: #8395a7;
+  --muted: #576574;
+  --green: #0ecb81;
+  --red: #e74c3c;
+  --orange: #f0a030;
+  --blue: #4090e0;
+  --purple: #a855f7;
+  --bn: #f0b90b;
+  --gt: #2955E7;
+  --radius: 12px;
+  --radius-sm: 8px;
+}}
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 10px; max-width: 800px; margin: 0 auto; }}
-h1 {{ font-size: 1.2rem; margin-bottom: 2px; }}
-h2 {{ font-size: 0.95rem; margin-bottom: 8px; color: #aaa; }}
-.header {{ text-align: center; margin-bottom: 12px; }}
-.header .ts {{ color: #555; font-size: 0.75rem; }}
-.section {{ background: #1a1a2e; border-radius: 10px; padding: 12px; margin-bottom: 10px; }}
-.balances {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(65px, 1fr)); gap: 6px; margin-bottom: 10px; }}
-.card {{ background: #1a1a2e; border-radius: 8px; padding: 8px 6px; text-align: center; }}
-.card.total {{ background: #16213e; border: 1px solid #f0b90b44; }}
-.card .label {{ font-size: 0.6rem; color: #888; }}
-.card .value {{ font-size: 0.9rem; font-weight: 700; margin-top: 2px; }}
-.stats {{ display: flex; flex-wrap: wrap; gap: 8px 16px; justify-content: center; font-size: 0.7rem; color: #999; margin-bottom: 8px; }}
-.stats b {{ color: #ddd; }}
-.position {{ display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 0.82rem; }}
-.position.reverse {{ border-left: 3px solid #f0a030; padding-left: 8px; }}
-.position.forward {{ border-left: 3px solid #4090e0; padding-left: 8px; }}
-.badge {{ display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.6rem; font-weight: 700; }}
-.badge.reverse {{ background: #f0a030; color: #1a1a2e; }}
-.badge.forward {{ background: #4090e0; color: #fff; }}
-.badge.cross {{ background: #a855f7; color: #fff; }}
-.badge.bn {{ background: #f0b90b; color: #111; }}
-.badge.gt {{ background: #2955E7; color: #fff; }}
-.pass {{ color: #0ecb81; font-weight: bold; }}
-.fail {{ color: #e74c3c; }}
-.table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 0.73rem; white-space: nowrap; }}
-th, td {{ padding: 4px 5px; text-align: left; border-bottom: 1px solid #252540; }}
-th {{ color: #888; font-weight: 600; position: sticky; top: 0; background: #1a1a2e; }}
-.calendar td {{ text-align: center; padding: 4px 2px; font-size: 0.75rem; cursor: default; }}
-.calendar td small {{ display: block; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  padding: 12px;
+  max-width: 860px;
+  margin: 0 auto;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}}
+h1 {{ font-size: 1.35rem; font-weight: 800; letter-spacing: -0.5px; }}
+h2 {{ font-size: 0.9rem; margin-bottom: 10px; color: var(--text2); font-weight: 600; display:flex; align-items:center; gap:8px; }}
+h2::after {{ content:''; flex:1; height:1px; background:var(--border); border-radius:1px; }}
+h3 {{ font-size: 0.82rem; margin-bottom: 6px; color: var(--text2); font-weight: 600; }}
+
+/* Header */
+.header {{
+  text-align: center;
+  margin-bottom: 16px;
+  padding: 20px 0 12px;
+}}
+.header .logo {{
+  display: inline-flex; align-items: center; gap: 10px;
+  background: linear-gradient(135deg, #f0b90b20, #2955E720);
+  border: 1px solid var(--border);
+  border-radius: 40px;
+  padding: 8px 24px;
+  margin-bottom: 8px;
+}}
+.header .logo .dot {{
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 10px var(--green);
+  animation: pulse 2s infinite;
+}}
+@keyframes pulse {{ 0%,100%{{opacity:1}} 50%{{opacity:.4}} }}
+.header h1 {{ background: linear-gradient(135deg, #f0b90b, #0ecb81); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+.header .ts {{ color: var(--muted); font-size: 0.7rem; margin-top: 4px; }}
+
+/* Cards */
+.balances {{
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}}
+.card {{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 8px;
+  text-align: center;
+  transition: border-color .2s;
+}}
+.card:hover {{ border-color: #334155; }}
+.card .label {{ font-size: 0.6rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }}
+.card .value {{ font-size: 0.85rem; font-weight: 700; margin-top: 3px; }}
+.stats {{
+  display: flex; flex-wrap: wrap; gap: 8px 20px;
+  justify-content: center; font-size: 0.7rem; color: var(--text2);
+  margin-bottom: 12px; padding: 10px;
+  background: var(--surface); border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}}
+.stats b {{ color: var(--text); font-weight: 600; }}
+
+/* Sections */
+.section {{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 12px;
+}}
+
+/* Position */
+.position {{
+  display: flex; flex-wrap: wrap; gap: 8px 16px;
+  align-items: center; font-size: 0.8rem;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface2);
+}}
+.position.reverse {{ border-left: 3px solid var(--orange); }}
+.position.forward {{ border-left: 3px solid var(--blue); }}
+
+/* Badges */
+.badge {{
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 0.6rem; font-weight: 700; letter-spacing: 0.3px;
+}}
+.badge.reverse {{ background: #f0a03022; color: var(--orange); border:1px solid #f0a03044; }}
+.badge.forward {{ background: #4090e022; color: var(--blue); border:1px solid #4090e044; }}
+.badge.cross {{ background: #a855f722; color: var(--purple); border:1px solid #a855f744; }}
+.badge.bn {{ background: #f0b90b22; color: var(--bn); border:1px solid #f0b90b44; }}
+.badge.gt {{ background: #2955E722; color: #6b9fff; border:1px solid #2955E744; }}
+.pass {{ color: var(--green); font-weight: bold; font-size:1.1em; }}
+.fail {{ color: var(--red); }}
+
+/* Tables */
+.table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--radius-sm); }}
+table {{ width: 100%; border-collapse: collapse; font-size: 0.72rem; white-space: nowrap; }}
+thead th {{
+  color: var(--muted); font-weight: 600; font-size: 0.65rem;
+  text-transform: uppercase; letter-spacing: 0.5px;
+  padding: 8px 6px; background: var(--surface2);
+  position: sticky; top: 0; z-index: 1;
+}}
+tbody td {{ padding: 6px; border-bottom: 1px solid #1a1a2e; }}
+tbody tr:hover {{ background: #ffffff04; }}
+tr.held {{ background: #0ecb8108; }}
+tr.held:hover {{ background: #0ecb8112; }}
+tr.cross-group {{ border-top: 2px solid #2a2a40; }}
+tr.cross-group td {{ padding-top: 10px; }}
+tr.cross-sub td {{ color: var(--text2); font-size: 0.68rem; padding: 2px 6px; }}
+tr.cross-sub td:first-child {{ padding-left: 18px; }}
+
+/* Calendar */
+.calendar {{ width: 100%; }}
+.calendar td {{
+  text-align: center; padding: 5px 3px; font-size: 0.75rem;
+  border-radius: 6px; cursor: default;
+}}
+.calendar td small {{ display: block; margin-top: 1px; }}
+.cal-nav {{
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text2); border-radius: 6px; padding: 4px 10px;
+  font-size: 0.75rem; cursor: pointer;
+}}
+.cal-nav:hover {{ background: var(--border); color: var(--text); }}
+#calTitle {{ display: inline-block; min-width: 130px; text-align: center; font-weight:600; }}
+
+/* Helpers */
 .right {{ text-align: right; }}
 .center {{ text-align: center; }}
-.positive {{ color: #4caf84; font-weight: 600; }}
-.negative {{ color: #e05560; font-weight: 600; }}
-.muted {{ color: #666; }}
-tr.held {{ background: #1e2a1e; }}
-tr.cross-group {{ border-top: 2px solid #444; }}
-tr.cross-group td {{ padding-top: 12px; }}
-tr.cross-sub td {{ color: #999; font-size: 0.85em; padding: 1px 6px; }}
-tr.cross-sub td:first-child {{ padding-left: 16px; }}
-.footer {{ text-align: center; color: #444; font-size: 0.65rem; margin-top: 12px; }}
-.cal-nav {{ background: none; border: 1px solid #444; color: #aaa; border-radius: 4px; padding: 2px 8px; font-size: 0.8rem; cursor: pointer; }}
-.cal-nav:hover {{ background: #252540; }}
-#calTitle {{ display: inline-block; min-width: 120px; text-align: center; }}
-@media (max-width: 500px) {{
-    .balances {{ grid-template-columns: repeat(3, 1fr); }}
-    table {{ font-size: 0.65rem; }}
-    th, td {{ padding: 3px 3px; }}
-    .calendar td {{ font-size: 0.68rem; }}
-    .stats {{ gap: 4px 10px; font-size: 0.65rem; }}
+.positive {{ color: var(--green); font-weight: 600; }}
+.negative {{ color: var(--red); font-weight: 600; }}
+.muted {{ color: var(--muted); }}
+
+.footer {{
+  text-align: center; color: #2a2a40; font-size: 0.65rem;
+  margin-top: 16px; padding-bottom: 20px;
+}}
+
+/* Mobile */
+@media (max-width: 600px) {{
+  body {{ padding: 8px; }}
+  .balances {{ grid-template-columns: repeat(4, 1fr); gap: 5px; }}
+  .card {{ padding: 7px 4px; }}
+  .card .value {{ font-size: 0.75rem; }}
+  .card .label {{ font-size: 0.55rem; }}
+  .section {{ padding: 10px; }}
+  table {{ font-size: 0.64rem; }}
+  thead th {{ font-size: 0.6rem; padding: 6px 4px; }}
+  tbody td {{ padding: 4px; }}
+  .header .logo {{ padding: 6px 16px; }}
+  h1 {{ font-size: 1.1rem; }}
+  .stats {{ gap: 4px 10px; font-size: 0.64rem; }}
 }}
 </style>
 </head>
 <body>
 <div class="header">
-    <h1>bazfbot 套利看板</h1>
-    <div class="ts">更新: {now_str} | 30s 刷新</div>
+  <div class="logo">
+    <span class="dot"></span>
+    <h1>ArbiBot 套利看板</h1>
+  </div>
+  <div class="ts">更新 {now_str} · 30s 自动刷新</div>
 </div>
 {balance_cards}
 {stats_html}
@@ -6394,7 +7647,7 @@ tr.cross-sub td:first-child {{ padding-left: 16px; }}
 {recent_html}
 {table_html}
 {cross_table_html}
-<div class="footer">bazfbot · Binance + Gate.io</div>
+<div class="footer">ArbiBot &copy; 2026 · Binance + Gate.io</div>
 
 <script>
 // ── 月历渲染 ──
@@ -6434,7 +7687,7 @@ function navCal(dir) {{
 renderCal(calYear, calMonth);
 </script>"""
 
-        if curve_data:
+        if has_curve:
             html += f"""
 <script>
 (function() {{
@@ -6445,21 +7698,45 @@ renderCal(calYear, calMonth);
             type: 'line',
             data: {{
                 labels: {labels_json},
-                datasets: [{{
-                    label: '总资金 (USDT)',
-                    data: {curve_json},
-                    borderColor: '#4caf84',
-                    backgroundColor: 'rgba(76,175,132,0.08)',
-                    fill: true,
-                    pointRadius: 0,
-                    borderWidth: 1.5,
-                    tension: 0.3,
-                }}]
+                datasets: [
+                    {{
+                        label: '总计',
+                        data: {total_json},
+                        borderColor: '#4caf84',
+                        backgroundColor: 'rgba(76,175,132,0.05)',
+                        fill: false,
+                        pointRadius: 0,
+                        borderWidth: 2.0,
+                        tension: 0.3,
+                    }},
+                    {{
+                        label: 'BN',
+                        data: {bn_json},
+                        borderColor: '#f0b90b',
+                        backgroundColor: 'transparent',
+                        fill: false,
+                        pointRadius: 0,
+                        borderWidth: 1.0,
+                        borderDash: [5, 5],
+                        tension: 0.3,
+                    }},
+                    {{
+                        label: 'Gate',
+                        data: {gt_json},
+                        borderColor: '#17c9a4',
+                        backgroundColor: 'transparent',
+                        fill: false,
+                        pointRadius: 0,
+                        borderWidth: 1.0,
+                        borderDash: [3, 3],
+                        tension: 0.3,
+                    }}
+                ]
             }},
             options: {{
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: {{ legend: {{ display: false }} }},
+                plugins: {{ legend: {{ display: true, position: 'top', labels: {{ color: '#aaa', font: {{ size: 10 }}, boxWidth: 16 }} }} }},
                 scales: {{
                     x: {{ ticks: {{ maxTicksLimit: 12, maxRotation: 0, color: '#666', font: {{ size: 10 }} }}, grid: {{ color: '#252540' }} }},
                     y: {{ ticks: {{ color: '#666', font: {{ size: 10 }} }}, grid: {{ color: '#252540' }} }}
