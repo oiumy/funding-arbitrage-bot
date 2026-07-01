@@ -1,19 +1,29 @@
 """
-Binance 现货-永续合约资金费率套利机器人。
+跨交易所（Binance + Gate）资金费率套利机器人。
+
+策略：纯合约多空对冲，在两所各开方向相反的仓位，价格波动完全抵消，
+      结算时赚取两所资金费率差额。
 
 运行环境:
     Python 3.10+
-    pip install ccxt pandas
+    pip install ccxt pandas aiohttp requests
+
+架构:
+    - 3 条 WebSocket 长连接：BN 热下单 + Gate 热下单&资费监控 + BN 资费监控（User Data Stream）
+    - REST 轮询扫描：每 60s 全量扫描两所费率，过滤流动性不足的币种
+    - 狙击机制：结算前 1s 通过 WS 并发下单开仓，平仓后记录盈亏到看板
 
 重要提示:
-    1. 默认连接 Binance Testnet。实盘前务必在测试网完整跑通。
+    1. 默认连接 Binance 实盘。测试请用 --testnet 或在 config.py 中设置 TESTNET=True。
     2. 资金费率、盘口深度、滑点、借贷成本、合约保证金模式都会影响真实收益。
-    3. 本脚本使用 REST 轮询，不使用 WebSocket，适合低频“打卡式”运行。
+    3. 跨所套利需要两个交易所都有足够的 USDT 余额。
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import hashlib
 import hmac
 import json
@@ -21,6 +31,7 @@ import logging
 import logging.handlers
 import math
 import os
+import resource
 import time
 import urllib.request
 import requests
@@ -332,6 +343,9 @@ class FundingArbitrageBot:
         self._gate_trade_ws: Any = None
         self._gate_trade_session: aiohttp.ClientSession | None = None
         self._gate_trade_futures: dict[str, asyncio.Future] = {}
+        # WS 持仓缓存（开平仓验证用，免 REST 网络往返）
+        self._bn_ws_positions: dict[str, float] = {}  # "SYMBOL|SHORT" → abs(positionAmt)
+        self._gate_ws_positions: dict[str, float] = {}  # "CONTRACT" → abs(size)
 
     @staticmethod
     def _ccxt_config(options: dict | None = None) -> dict[str, Any]:
@@ -503,6 +517,11 @@ class FundingArbitrageBot:
 
     async def initialize(self) -> None:
         """加载市场元数据，建立资费监听 WS 长连接。"""
+        # 大块内存(>128KB)走 mmap，释放时直接归还 OS，不经过 glibc arena 囤积
+        try:
+            ctypes.CDLL("libc.so.6").mallopt(-8, 128 * 1024)  # M_MMAP_THRESHOLD
+        except Exception:
+            pass
         # 全部交易所 load_markets 加重试（VPS 时钟偏差/网络抖动可导致 InvalidNonce/超时）
         for name, ex, fatal in [("spot", self.spot, True), ("futures", self.futures, True),
                                 ("gate_spot", self.gate_spot, False), ("gate_futures", self.gate_futures, False)]:
@@ -883,7 +902,7 @@ class FundingArbitrageBot:
             size = float(p.get("size", 0) or 0)
             result.append({
                 "symbol": sym,
-                "contracts": abs(size),
+                "contracts": size,  # 保留正负号：正=多，负=空
                 "side": "long" if size > 0 else "short" if size < 0 else "",
                 "notional": abs(size) * float(p.get("mark_price", 0) or 0),
                 "info": p,
@@ -2217,11 +2236,32 @@ class FundingArbitrageBot:
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _log_memory() -> None:
+        """记录当前进程 RSS + VmData 到日志，并触发 malloc_trim 归还空闲堆内存。"""
+        try:
+            vm_data = vm_rss = 0
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        vm_rss = int(line.split()[1])
+                    elif line.startswith("VmData:"):
+                        vm_data = int(line.split()[1])
+            logger.info("[内存] RSS: %.0f MB | Data: %.0f MB", vm_rss / 1024, vm_data / 1024)
+            # 强制 glibc 把堆上空闲页归还 OS（pandas/numpy free 后 glibc arena 囤着不还）
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _build_futures_market_index(self) -> dict[str, dict[str, Any]]:
         index: dict[str, dict[str, Any]] = {}
         bn_markets = getattr(self.futures, "markets", None)
         if not bn_markets:
             return index
+        tradfi_skipped = 0
         for market in bn_markets.values():
             is_usdt_swap = (
                 market.get("swap")
@@ -2230,7 +2270,12 @@ class FundingArbitrageBot:
                 and market.get("active", True)
             )
             if is_usdt_swap:
+                if market.get("info", {}).get("underlyingType") == "STOCK":
+                    tradfi_skipped += 1
+                    continue
                 index[market["base"]] = market
+        if tradfi_skipped:
+            logger.info("Binance 跳过 %d 个 TradFi 股票代币", tradfi_skipped)
         return index
 
     def _build_gate_futures_market_index(self) -> dict[str, dict[str, Any]]:
@@ -2714,8 +2759,8 @@ class FundingArbitrageBot:
                 continue
             contracts = self._position_contracts(pos)
             if self.gate_state.direction == "reverse":
-                return contracts > 0
-            return contracts < 0
+                return contracts < 0  # 反向=做空合约
+            return contracts > 0      # 正向=做多合约
         return False
 
     async def _has_gate_margin_loan(self) -> bool:
@@ -3546,7 +3591,7 @@ class FundingArbitrageBot:
         spot_usdt = self._free_balance(spot_free, "USDT")
         futures_usdt = self._free_balance(futures_free, "USDT")
         if spot_usdt <= 0 and futures_usdt > 0:
-            logger.warning("现货余额获取失败（测试网正常现象），跳过划转。")
+            logger.warning("现货余额获取失败（测试网现货 API 可能不可用），跳过划转。")
             return
         total = spot_usdt + futures_usdt
         if total <= 0:
@@ -3595,11 +3640,11 @@ class FundingArbitrageBot:
         spot_usdt = self._free_balance(spot_free, "USDT")
         futures_usdt = self._free_balance(futures_free, "USDT")
 
-        # 测试网：现货 API 可能不可用，用合约余额估算（假设两账户各半）
+        # 现货 API 不可用时（如测试网），用合约余额估算（假设两账户各半）
         if spot_usdt <= 0 and futures_usdt > 0 and USE_TESTNET:
             estimated_total = futures_usdt * 0.5
             logger.warning(
-                "现货余额获取失败（测试网正常现象），假设两账户均分: 每腿 ~%.2f USDT",
+                "现货余额获取失败（测试网现货 API 可能不可用），假设两账户均分: 每腿 ~%.2f USDT",
                 estimated_total * POSITION_SIZE_RATIO,
             )
             size = estimated_total * POSITION_SIZE_RATIO
@@ -4569,6 +4614,21 @@ class FundingArbitrageBot:
             logger.warning("验证Gate持仓失败 %s: %s", symbol, exc)
         return 0.0
 
+    def _ws_position_check(self, exchange: str, symbol: str, position_side: str,
+                           expect_zero: bool, amount: float) -> tuple[bool, float]:
+        """WS 缓存快速查持仓（免 REST）。返回 (confirmed, position_size)。
+        cache miss 返回 (False, -1) 表示需等待或 REST 兜底。"""
+        if exchange == "binance":
+            clean = self._clean_futures_symbol(symbol)
+            pos = self._bn_ws_positions.get(f"{clean}|{position_side}")
+        else:
+            pos = self._gate_ws_positions.get(self._to_gate_contract(symbol))
+        if pos is None:
+            return False, -1.0
+        if expect_zero:
+            return pos < amount * 0.1, pos
+        return pos > 0, pos
+
     async def _query_bn_funding_amount(self, symbol: str, settle_ms: int) -> float:
         """查币安结算时刻的实际 FUNDING_FEE 金额。"""
         try:
@@ -4596,6 +4656,8 @@ class FundingArbitrageBot:
             if isinstance(resp, list):
                 for item in resp:
                     if isinstance(item, dict) and item.get("time", 0) >= after_ms - 1000:
+                        ft = datetime.fromtimestamp(item["time"] / 1000, tz=self.tz)
+                        logger.info("[资费] BN 资费到账时间: %s", ft.strftime("%H:%M:%S.%f")[:-3])
                         return True
         except Exception:
             pass
@@ -4685,6 +4747,12 @@ class FundingArbitrageBot:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = _json.loads(msg.data)
                         if data.get("e") == "ACCOUNT_UPDATE":
+                            # 缓存所有持仓到 WS cache（开平仓验证免 REST）
+                            for p in (data.get("a", {}).get("P", []) or []):
+                                sym = p.get("s", "")
+                                ps = p.get("ps", "")
+                                if sym and ps:
+                                    self._bn_ws_positions[f"{sym}|{ps}"] = abs(float(p.get("pa", 0) or 0))
                             if data.get("a", {}).get("m") == "FUNDING_FEE":
                                 logger.info("[资费监听] BN 资费已到账")
                                 self._funding_event.set()
@@ -5019,13 +5087,19 @@ class FundingArbitrageBot:
                         ev = hdr.get("event", "") or data.get("event", "")
                         if ch == "futures.ping":
                             await ws.send_json({"time": int(time.time()), "channel": "futures.pong"})
-                        # ── 持仓变动（资费结算监听）──
+                        # ── 持仓变动（资费结算监听 + 持仓缓存）──
                         elif ch == "futures.positions" and ev == "update":
+                            result = data.get("data", {}).get("result", data.get("result", []))
+                            for pos in (result if isinstance(result, list) else [result]):
+                                ctr = pos.get("contract", "")
+                                if ctr:
+                                    # 缓存所有合约持仓（开平仓验证免 REST）
+                                    self._gate_ws_positions[ctr] = abs(float(pos.get("size", 0) or 0))
+                            # 资费结算检测
                             symbol = getattr(self, "_gate_funding_symbol", "")
                             baseline = getattr(self, "_gate_funding_baseline", 0.0)
                             contract = self._to_gate_contract(symbol) if symbol else ""
                             if contract:
-                                result = data.get("data", {}).get("result", data.get("result", []))
                                 for pos in (result if isinstance(result, list) else [result]):
                                     if pos.get("contract") == contract:
                                         pnl = float(pos.get("pnl_fund", 0) or 0)
@@ -5201,150 +5275,206 @@ class FundingArbitrageBot:
             self._leverage_set.add(key)
 
     async def _cross_open_short_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """在指定交易所做空合约（杠杆已在 T-10s 狙击阶段预设，此处不再调 REST）。"""
+        """在指定交易所做空合约。WS 缓存验证，无 REST 网络往返。"""
+        position_side = "SHORT"
         if exchange == "binance":
+            order, ws_error = None, None
             try:
                 order = await self._bn_trade_ws_order(symbol, "sell", amount, position_side="SHORT")
-                return LegResult(True, "futures", symbol, "sell", amount, order=order)
             except Exception as exc:
-                logger.warning("合约开空异常 %s: %s，验证实际持仓...", symbol, exc)
-                actual = await self._cross_verify_binance_position(symbol, "SHORT")
-                if actual > 0:
-                    logger.warning("合约开空实际已成交 %s: filled=%.4f (API返回0但持仓存在)",
-                                   symbol, actual)
-                    return LegResult(True, "futures", symbol, "sell", actual,
-                                     order={"id": "verified", "symbol": symbol, "side": "sell",
-                                            "amount": actual, "filled": actual, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("合约开空确认失败 %s: %s", symbol, exc)
-                return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
+                ws_error = str(exc)
+                logger.warning("合约开空WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            # WS 缓存验证
+            ok, pos = self._ws_position_check("binance", symbol, "SHORT", expect_zero=False, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, pos = self._ws_position_check("binance", symbol, "SHORT", expect_zero=False, amount=amount)
+            if not ok:
+                pos = await self._cross_verify_binance_position(symbol, "SHORT")
+                ok = pos > 0
+            if ok:
+                if ws_error:
+                    logger.warning("开空持仓验证通过 %s: filled=%.4f (API异常但持仓存在)", symbol, pos)
+                return LegResult(True, "futures", symbol, "sell", pos,
+                                 order=order or {"id": "verified", "symbol": symbol, "side": "sell",
+                                                "amount": pos, "filled": pos, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("开空确认失败 %s: err=%s", symbol, ws_error or "持仓验证未通过")
+            return LegResult(False, "futures", symbol, "sell", amount, error=ws_error or "position not found")
         else:
+            order, ws_error = None, None
             try:
                 order = await self._gate_trade_ws_order(symbol, "sell", amount)
-                ok = order.get("status") == "closed"
-                if ok:
-                    logger.info("[跨交易所] Gate开空成功 %s: filled=%.4f", symbol, order["filled"])
-                else:
-                    logger.error("[跨交易所] Gate开空未成交 %s: status=%s", symbol, order.get("status"))
-                return LegResult(ok, "futures", symbol, "sell", amount, order=order,
-                                 error=None if ok else "Gate short not filled")
             except Exception as exc:
-                logger.warning("[跨交易所] Gate开空异常 %s: %s，验证实际持仓...", symbol, exc)
-                actual = await self._cross_verify_gate_position(symbol)
-                if actual > 0:
-                    logger.warning("Gate开空实际已成交 %s: filled=%.4f (API异常但持仓存在)", symbol, actual)
-                    return LegResult(True, "futures", symbol, "sell", actual,
-                                     order={"id": "verified", "symbol": symbol, "side": "sell",
-                                            "amount": actual, "filled": actual, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("Gate开空确认失败 %s: %s", symbol, exc)
-                return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
+                ws_error = str(exc)
+                logger.warning("Gate开空WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            ok, pos = self._ws_position_check("gate", symbol, "", expect_zero=False, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, pos = self._ws_position_check("gate", symbol, "", expect_zero=False, amount=amount)
+            if not ok:
+                pos = await self._cross_verify_gate_position(symbol)
+                ok = pos > 0
+            if ok:
+                if ws_error:
+                    logger.warning("Gate开空WS缓存验证通过 %s: filled=%.4f", symbol, pos)
+                else:
+                    logger.info("[跨交易所] Gate开空成功 %s: filled=%.4f", symbol, pos)
+                return LegResult(True, "futures", symbol, "sell", pos,
+                                 order=order or {"id": "verified", "symbol": symbol, "side": "sell",
+                                                "amount": pos, "filled": pos, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("Gate开空确认失败 %s: err=%s", symbol, ws_error or "WS缓存+REST均未通过")
+            return LegResult(False, "futures", symbol, "sell", amount, error=ws_error or "Gate short position not found")
 
     async def _cross_open_long_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """在指定交易所做多合约（杠杆已在 T-10s 狙击阶段预设，此处不再调 REST）。"""
+        """在指定交易所做多合约。WS 缓存验证，无 REST 网络往返。"""
         if exchange == "binance":
+            order, ws_error = None, None
             try:
                 order = await self._bn_trade_ws_order(symbol, "buy", amount, position_side="LONG")
-                return LegResult(True, "futures", symbol, "buy", amount, order=order)
             except Exception as exc:
-                logger.warning("合约开多异常 %s: %s，验证实际持仓...", symbol, exc)
-                actual = await self._cross_verify_binance_position(symbol, "LONG")
-                if actual > 0:
-                    logger.warning("合约开多实际已成交 %s: filled=%.4f (API返回0但持仓存在)",
-                                   symbol, actual)
-                    return LegResult(True, "futures", symbol, "buy", actual,
-                                     order={"id": "verified", "symbol": symbol, "side": "buy",
-                                            "amount": actual, "filled": actual, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("合约开多确认失败 %s: %s", symbol, exc)
-                return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
+                ws_error = str(exc)
+                logger.warning("合约开多WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            ok, pos = self._ws_position_check("binance", symbol, "LONG", expect_zero=False, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, pos = self._ws_position_check("binance", symbol, "LONG", expect_zero=False, amount=amount)
+            if not ok:
+                pos = await self._cross_verify_binance_position(symbol, "LONG")
+                ok = pos > 0
+            if ok:
+                if ws_error:
+                    logger.warning("开多持仓验证通过 %s: filled=%.4f (API异常但持仓存在)", symbol, pos)
+                return LegResult(True, "futures", symbol, "buy", pos,
+                                 order=order or {"id": "verified", "symbol": symbol, "side": "buy",
+                                                "amount": pos, "filled": pos, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("开多确认失败 %s: err=%s", symbol, ws_error or "持仓验证未通过")
+            return LegResult(False, "futures", symbol, "buy", amount, error=ws_error or "position not found")
         else:
+            order, ws_error = None, None
             try:
                 order = await self._gate_trade_ws_order(symbol, "buy", amount)
-                ok = order.get("status") == "closed"
-                if ok:
-                    logger.info("[跨交易所] Gate开多成功 %s: filled=%.4f", symbol, order["filled"])
-                else:
-                    logger.error("[跨交易所] Gate开多未成交 %s: status=%s", symbol, order.get("status"))
-                return LegResult(ok, "futures", symbol, "buy", amount, order=order,
-                                 error=None if ok else "Gate long not filled")
             except Exception as exc:
-                logger.warning("[跨交易所] Gate开多异常 %s: %s，验证实际持仓...", symbol, exc)
-                actual = await self._cross_verify_gate_position(symbol)
-                if actual > 0:
-                    logger.warning("Gate开多实际已成交 %s: filled=%.4f (API异常但持仓存在)", symbol, actual)
-                    return LegResult(True, "futures", symbol, "buy", actual,
-                                     order={"id": "verified", "symbol": symbol, "side": "buy",
-                                            "amount": actual, "filled": actual, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("Gate开多确认失败 %s: %s", symbol, exc)
-                return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
+                ws_error = str(exc)
+                logger.warning("Gate开多WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            ok, pos = self._ws_position_check("gate", symbol, "", expect_zero=False, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, pos = self._ws_position_check("gate", symbol, "", expect_zero=False, amount=amount)
+            if not ok:
+                pos = await self._cross_verify_gate_position(symbol)
+                ok = pos > 0
+            if ok:
+                if ws_error:
+                    logger.warning("Gate开多WS缓存验证通过 %s: filled=%.4f", symbol, pos)
+                else:
+                    logger.info("[跨交易所] Gate开多成功 %s: filled=%.4f", symbol, pos)
+                return LegResult(True, "futures", symbol, "buy", pos,
+                                 order=order or {"id": "verified", "symbol": symbol, "side": "buy",
+                                                "amount": pos, "filled": pos, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("Gate开多确认失败 %s: err=%s", symbol, ws_error or "WS缓存+REST均未通过")
+            return LegResult(False, "futures", symbol, "buy", amount, error=ws_error or "Gate long position not found")
 
     async def _cross_close_short_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """平空单（买入平空）。"""
+        """平空单（买入平空）。WS 缓存验证，无 REST 网络往返。"""
         if exchange == "binance":
+            order, ws_error = None, None
             try:
                 order = await self._bn_trade_ws_order(symbol, "buy", amount, reduce_only=True, position_side="SHORT")
-                return LegResult(True, "futures", symbol, "buy", amount, order=order)
             except Exception as exc:
+                ws_error = str(exc)
+                logger.warning("平空WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            ok, remaining = self._ws_position_check("binance", symbol, "SHORT", expect_zero=True, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, remaining = self._ws_position_check("binance", symbol, "SHORT", expect_zero=True, amount=amount)
+            if not ok:
                 remaining = await self._cross_verify_binance_position(symbol, "SHORT")
-                if remaining < amount * 0.1:
-                    logger.warning("平空已成交 %s: 仓位已消失 (API返回filled=0)", symbol)
-                    return LegResult(True, "futures", symbol, "buy", amount,
-                                     order={"id": "verified_close", "symbol": symbol, "side": "buy",
-                                            "amount": amount, "filled": amount, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("平空确认失败 %s: 剩余=%.4f err=%s", symbol, remaining, exc)
-                return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
+                ok = remaining < amount * 0.1
+            if ok:
+                if ws_error:
+                    logger.warning("平空WS缓存验证通过 %s: 仓位已消失 (API异常但持仓已平)", symbol)
+                return LegResult(True, "futures", symbol, "buy", amount,
+                                 order=order or {"id": "verified_close", "symbol": symbol, "side": "buy",
+                                                "amount": amount, "filled": amount, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("平空确认失败 %s: err=%s", symbol, ws_error or "WS缓存+REST均未通过")
+            return LegResult(False, "futures", symbol, "buy", amount, error=ws_error or "close short position still exists")
         else:
+            order, ws_error = None, None
             try:
                 order = await self._gate_trade_ws_order(symbol, "buy", amount, reduce_only=True)
-                ok = order.get("status") == "closed"
-                return LegResult(ok, "futures", symbol, "buy", amount, order=order,
-                                 error=None if ok else "Gate close short not filled")
             except Exception as exc:
+                ws_error = str(exc)
+                logger.warning("Gate平空WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            ok, remaining = self._ws_position_check("gate", symbol, "", expect_zero=True, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, remaining = self._ws_position_check("gate", symbol, "", expect_zero=True, amount=amount)
+            if not ok:
                 remaining = await self._cross_verify_gate_position(symbol)
-                if remaining < amount * 0.1:
-                    logger.warning("Gate平空已成交 %s: 仓位已消失 (API返回异常)", symbol)
-                    return LegResult(True, "futures", symbol, "buy", amount,
-                                     order={"id": "verified_close", "symbol": symbol, "side": "buy",
-                                            "amount": amount, "filled": amount, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("Gate平空确认失败 %s: 剩余=%.4f err=%s", symbol, remaining, exc)
-                return LegResult(False, "futures", symbol, "buy", amount, error=str(exc))
+                ok = remaining < amount * 0.1
+            if ok:
+                if ws_error:
+                    logger.warning("Gate平空WS缓存验证通过 %s: 仓位已消失", symbol)
+                return LegResult(True, "futures", symbol, "buy", amount,
+                                 order=order or {"id": "verified_close", "symbol": symbol, "side": "buy",
+                                                "amount": amount, "filled": amount, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("Gate平空确认失败 %s: err=%s", symbol, ws_error or "WS缓存+REST均未通过")
+            return LegResult(False, "futures", symbol, "buy", amount, error=ws_error or "Gate close short position still exists")
 
     async def _cross_close_long_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """平多单（卖出平多）。"""
+        """平多单（卖出平多）。WS 缓存验证，无 REST 网络往返。"""
         if exchange == "binance":
+            order, ws_error = None, None
             try:
                 order = await self._bn_trade_ws_order(symbol, "sell", amount, reduce_only=True, position_side="LONG")
-                return LegResult(True, "futures", symbol, "sell", amount, order=order)
             except Exception as exc:
+                ws_error = str(exc)
+                logger.warning("平多WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            ok, remaining = self._ws_position_check("binance", symbol, "LONG", expect_zero=True, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, remaining = self._ws_position_check("binance", symbol, "LONG", expect_zero=True, amount=amount)
+            if not ok:
                 remaining = await self._cross_verify_binance_position(symbol, "LONG")
-                if remaining < amount * 0.1:
-                    logger.warning("平多已成交 %s: 仓位已消失 (API返回filled=0)", symbol)
-                    return LegResult(True, "futures", symbol, "sell", amount,
-                                     order={"id": "verified_close", "symbol": symbol, "side": "sell",
-                                            "amount": amount, "filled": amount, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("平多确认失败 %s: 剩余=%.4f err=%s", symbol, remaining, exc)
-                return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
+                ok = remaining < amount * 0.1
+            if ok:
+                if ws_error:
+                    logger.warning("平多WS缓存验证通过 %s: 仓位已消失 (API异常但持仓已平)", symbol)
+                return LegResult(True, "futures", symbol, "sell", amount,
+                                 order=order or {"id": "verified_close", "symbol": symbol, "side": "sell",
+                                                "amount": amount, "filled": amount, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("平多确认失败 %s: err=%s", symbol, ws_error or "WS缓存+REST均未通过")
+            return LegResult(False, "futures", symbol, "sell", amount, error=ws_error or "close long position still exists")
         else:
+            order, ws_error = None, None
             try:
                 order = await self._gate_trade_ws_order(symbol, "sell", amount, reduce_only=True)
-                ok = order.get("status") == "closed"
-                return LegResult(ok, "futures", symbol, "sell", amount, order=order,
-                                 error=None if ok else "Gate close long not filled")
             except Exception as exc:
+                ws_error = str(exc)
+                logger.warning("Gate平多WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            ok, remaining = self._ws_position_check("gate", symbol, "", expect_zero=True, amount=amount)
+            if not ok:
+                await asyncio.sleep(0.05)
+                ok, remaining = self._ws_position_check("gate", symbol, "", expect_zero=True, amount=amount)
+            if not ok:
                 remaining = await self._cross_verify_gate_position(symbol)
-                if remaining < amount * 0.1:
-                    logger.warning("Gate平多已成交 %s: 仓位已消失 (API返回异常)", symbol)
-                    return LegResult(True, "futures", symbol, "sell", amount,
-                                     order={"id": "verified_close", "symbol": symbol, "side": "sell",
-                                            "amount": amount, "filled": amount, "status": "closed",
-                                            "info": {"verified_after_error": str(exc)}})
-                logger.error("Gate平多确认失败 %s: 剩余=%.4f err=%s", symbol, remaining, exc)
-                return LegResult(False, "futures", symbol, "sell", amount, error=str(exc))
+                ok = remaining < amount * 0.1
+            if ok:
+                if ws_error:
+                    logger.warning("Gate平多WS缓存验证通过 %s: 仓位已消失", symbol)
+                return LegResult(True, "futures", symbol, "sell", amount,
+                                 order=order or {"id": "verified_close", "symbol": symbol, "side": "sell",
+                                                "amount": amount, "filled": amount, "status": "closed",
+                                                "info": {"verified_after_error": ws_error or ""}})
+            logger.error("Gate平多确认失败 %s: err=%s", symbol, ws_error or "WS缓存+REST均未通过")
+            return LegResult(False, "futures", symbol, "sell", amount, error=ws_error or "Gate close long position still exists")
 
     async def _cross_calculate_amount(self, exchange: str, symbol: str,
                                        reference_price: float, total_usdt: float) -> float:
@@ -5940,6 +6070,7 @@ class FundingArbitrageBot:
 
     async def _run_cross_exchange_cycle(self, force_entry: bool) -> None:
         """跨交易所套利主循环。"""
+        self._log_memory()
         has_position = self.cross_state.is_open
 
         # 启动/状态重置后先检查游离仓位，防止裸仓
@@ -6054,54 +6185,81 @@ class FundingArbitrageBot:
                     self._next_snipe_settle_ms = 0
                     await self._update_cross_dashboard(bn_bal, gt_bal)
                     return
-                candidate = passing.iloc[0]
-                logger.info("[跨交易所] 狙击目标 %s: 费率差=%.4f%% 净收益=%.4f%%",
-                             str(candidate["base"]),
-                             float(candidate["rate_spread"]) * 100,
-                             float(candidate["net_rate"]) * 100)
+                # 遍历通过筛选的候选，直到一个通过数量计算
+                chosen = None
+                for idx in range(min(10, len(passing))):
+                    candidate = passing.iloc[idx]
+                    logger.info("[跨交易所] 狙击目标 #%d %s: 费率差=%.4f%% 净收益=%.4f%%",
+                                 idx + 1, str(candidate["base"]),
+                                 float(candidate["rate_spread"]) * 100,
+                                 float(candidate["net_rate"]) * 100)
 
-                # ── 计算开仓参数（余额/价格/数量全在这算好，开仓函数只管下单）──
-                c_base = str(candidate["base"])
-                c_short_ex = str(candidate["short_exchange"])
-                c_long_ex = str(candidate["long_exchange"])
-                c_short_sym = str(candidate["short_symbol"])
-                c_long_sym = str(candidate["long_symbol"])
-                c_short_price = float(candidate["short_price"])
-                c_long_price = float(candidate["long_price"])
-                if c_short_price <= 0 or c_long_price <= 0:
-                    logger.error("[跨交易所] 狙击价格为零: short=%.6f long=%.6f (ticker数据缺失)", c_short_price, c_long_price)
-                    self._next_snipe_settle_ms = 0
-                    return
-                c_short_rate = float(candidate["short_rate"])
-                c_long_rate = float(candidate["long_rate"])
-                c_rate_spread = float(candidate["rate_spread"])
-                c_net_rate = float(candidate["net_rate"])
-                c_short_nft = float(candidate["short_next_funding_time_ms"])
-                c_long_nft = float(candidate["long_next_funding_time_ms"])
+                    # ── 计算开仓参数 ──
+                    c_base = str(candidate["base"])
+                    c_short_ex = str(candidate["short_exchange"])
+                    c_long_ex = str(candidate["long_exchange"])
+                    c_short_sym = str(candidate["short_symbol"])
+                    c_long_sym = str(candidate["long_symbol"])
+                    c_short_price = float(candidate["short_price"])
+                    c_long_price = float(candidate["long_price"])
+                    if c_short_price <= 0 or c_long_price <= 0:
+                        logger.warning("[跨交易所] 狙击 #%d 价格为零，跳过", idx + 1)
+                        continue
+                    c_short_rate = float(candidate["short_rate"])
+                    c_long_rate = float(candidate["long_rate"])
+                    c_rate_spread = float(candidate["rate_spread"])
+                    c_net_rate = float(candidate["net_rate"])
+                    c_short_nft = float(candidate["short_next_funding_time_ms"])
+                    c_long_nft = float(candidate["long_next_funding_time_ms"])
 
-                c_short_bal = bn_bal if c_short_ex == "binance" else gt_bal
-                c_long_bal = bn_bal if c_long_ex == "binance" else gt_bal
-                c_short_notional = c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
-                c_long_notional = c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
-                # 取较小名义金额确保双边等名义值（不同交易所 contractSize 不同，不能 min 张数）
-                c_min_notional = min(c_short_notional, c_long_notional)
-                c_short_qty = await self._cross_calculate_amount(c_short_ex, c_short_sym, c_short_price, c_min_notional)
-                c_long_qty = await self._cross_calculate_amount(c_long_ex, c_long_sym, c_long_price, c_min_notional)
-                if c_short_qty <= 0 or c_long_qty <= 0:
-                    logger.error("[跨交易所] 狙击数量计算失败")
+                    c_short_bal = bn_bal if c_short_ex == "binance" else gt_bal
+                    c_long_bal = bn_bal if c_long_ex == "binance" else gt_bal
+                    c_short_notional = c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
+                    c_long_notional = c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE
+                    c_min_notional = min(c_short_notional, c_long_notional)
+                    c_short_qty = await self._cross_calculate_amount(c_short_ex, c_short_sym, c_short_price, c_min_notional)
+                    c_long_qty = await self._cross_calculate_amount(c_long_ex, c_long_sym, c_long_price, c_min_notional)
+                    if c_short_qty <= 0 or c_long_qty <= 0:
+                        logger.warning("[跨交易所] 狙击 #%d 数量不足，尝试下一位", idx + 1)
+                        continue
+                    est_short = c_min_notional
+                    est_long = c_min_notional
+                    if est_short > c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1 or \
+                       est_long > c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1:
+                        logger.warning("[跨交易所] 狙击 #%d 数量超限，跳过", idx + 1)
+                        continue
+                    if est_short < 5.5 or est_long < 5.5:
+                        logger.warning("[跨交易所] 狙击 #%d 仓位太小(≈%.2f USDT)，跳过", idx + 1, est_short)
+                        continue
+                    chosen = candidate
+                    break
+
+                if chosen is None:
+                    logger.warning("[跨交易所] 所有狙击候选均未通过数量计算，放弃本轮")
                     self._next_snipe_settle_ms = 0
                     return
-                est_short = c_min_notional  # 双边等名义 USDT
-                est_long = c_min_notional
-                if est_short > c_short_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1 or \
-                   est_long > c_long_bal * CROSS_POSITION_SIZE_RATIO * CROSS_LEVERAGE * 1.1:
-                    logger.error("[跨交易所] 狙击数量超限: short≈%.2f long≈%.2f", est_short, est_long)
-                    self._next_snipe_settle_ms = 0
-                    return
-                if est_short < 5.5 or est_long < 5.5:
-                    logger.warning("[跨交易所] 狙击仓位太小: short≈%.2f long≈%.2f USDT，跳过", est_short, est_long)
-                    self._next_snipe_settle_ms = 0
-                    return
+                candidate = chosen
+                # 目标确认后立即订阅 Gate 资费 WS，不等开仓成功后再订
+                gt_sym = c_short_sym if c_short_ex == "gate" else c_long_sym
+                self._gate_funding_symbol = gt_sym
+                self._gate_funding_baseline = 0.0
+                try:
+                    await self._gate_subscribe_position(gt_sym)
+                except Exception:
+                    pass
+                try:
+                    existing = await self._safe_request(
+                        "gate_funding_baseline",
+                        lambda: self._fetch_gate_positions_direct(gt_sym),
+                        default=[],
+                    )
+                    for pos in existing:
+                        if pos.get("symbol") == gt_sym:
+                            self._gate_funding_baseline = float(pos.get("info", {}).get("pnl_fund", 0) or 0)
+                            break
+                except Exception:
+                    pass
+                logger.info("[资费监听] Gate 目标 %s baseline=%.4f (已提前订阅)", gt_sym, self._gate_funding_baseline)
                 # 提前设杠杆，省去开仓时 API 调用延迟 (~66ms)
                 await asyncio.gather(
                     self._cross_ensure_leverage(c_short_ex, c_short_sym),
@@ -6127,24 +6285,6 @@ class FundingArbitrageBot:
                 if ok:
                     settle_ms = max(c_short_nft, c_long_nft)
                     try:
-                        # 设置 Gate 监听目标 + REST 查询基线 pnl_fund
-                        gt_sym = c_short_sym if c_short_ex == "gate" else c_long_sym
-                        self._gate_funding_symbol = gt_sym
-                        self._gate_funding_baseline = 0.0
-                        await self._gate_subscribe_position(gt_sym)
-                        try:
-                            existing = await self._safe_request(
-                                "gate_funding_baseline",
-                                lambda: self._fetch_gate_positions_direct(gt_sym),
-                                default=[],
-                            )
-                            for pos in existing:
-                                if pos.get("symbol") == gt_sym:
-                                    self._gate_funding_baseline = float(pos.get("info", {}).get("pnl_fund", 0) or 0)
-                                    break
-                        except Exception:
-                            pass
-                        logger.info("[资费监听] Gate 目标 %s baseline=%.4f", gt_sym, self._gate_funding_baseline)
                         # 清除双 WS 事件标记
                         self._funding_event.clear()
                         self._gate_funding_event.clear()
@@ -6236,6 +6376,7 @@ class FundingArbitrageBot:
                     await self._run_cross_exchange_cycle(False)
                 finally:
                     self._snipe_loop_guard = False
+                gc.collect()
                 return
 
     async def _update_cross_dashboard(self, bn_fut_bal: float, gt_fut_bal: float) -> None:
@@ -6268,6 +6409,9 @@ class FundingArbitrageBot:
             gt_total = getattr(self, "_dash_gate_spot", 0.0)
             self._record_balance_snapshot(bn_total, gt_total)
             self._write_dashboard()
+            # 强制回收内存，防止 RSS 持续上涨
+            gc.collect()
+            self._log_memory()
             return
 
         # ── 并行检查两交易所持仓 ──
@@ -7823,12 +7967,12 @@ def _print_opportunity_table(df: pd.DataFrame, ref_usdt: float, direction: str =
 
 async def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="币安资金费率套利机器人")
-    parser.add_argument("--scan", action="store_true", help="仅扫描打印机会（正向+反向），不下单")
-    parser.add_argument("--scan-reverse", action="store_true", help="仅扫描反向套利机会（负费率）")
-    parser.add_argument("--live", action="store_true", help="实盘模式 (默认测试网)")
-    parser.add_argument("--no-gate", action="store_true", help="禁用 Gate.io 交易 (仅 Binance)")
-    parser.add_argument("--cross", action="store_true", help="启用跨交易所资金费率差异套利")
+    parser = argparse.ArgumentParser(description="跨交易所资金费率套利机器人 (Binance + Gate)")
+    parser.add_argument("--scan", action="store_true", help="扫描模式：打印机会为不干（正向+反向），不下单")
+    parser.add_argument("--scan-reverse", action="store_true", help="扫描模式：仅反向套利（负费率）")
+    parser.add_argument("--live", action="store_true", help="实盘模式（不加此参数不实际下单）")
+    parser.add_argument("--no-gate", action="store_true", help="仅用 Binance，禁用 Gate")
+    parser.add_argument("--cross", action="store_true", help="跨交易所套利模式（必加）")
     args = parser.parse_args()
 
     global USE_TESTNET, GATE_TRADING_ENABLED, CROSS_EXCHANGE_ENABLED

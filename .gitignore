@@ -8,3 +8,4 @@ data/
 tools/
 __pycache__/
 *.pyc
+notes.md
