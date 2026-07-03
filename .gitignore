@@ -1,11 +1,6 @@
 config.py
-COMMANDS.md
-PROJECT_EXPERIENCE.md
-PROJECT_PLAN.md
-logs/
-reports/
-data/
-tools/
 __pycache__/
 *.pyc
-notes.md
+logs/
+docs/
+backtest/

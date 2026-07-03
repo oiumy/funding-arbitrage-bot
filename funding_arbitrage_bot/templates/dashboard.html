@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta http-equiv="refresh" content="30">
+<title>ArbiBot · 套利看板</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #080c14;
+  --surface: #111827;
+  --surface2: #1a2332;
+  --border: #1e2d3d;
+  --text: #c8d6e5;
+  --text2: #8395a7;
+  --muted: #576574;
+  --green: #0ecb81;
+  --red: #e74c3c;
+  --orange: #f0a030;
+  --blue: #4090e0;
+  --purple: #a855f7;
+  --bn: #f0b90b;
+  --gt: #2955E7;
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  padding: 12px;
+  max-width: 860px;
+  margin: 0 auto;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+h1 { font-size: 1.35rem; font-weight: 800; letter-spacing: -0.5px; }
+h2 { font-size: 0.9rem; margin-bottom: 10px; color: var(--text2); font-weight: 600; display:flex; align-items:center; gap:8px; }
+h2::after { content:''; flex:1; height:1px; background:var(--border); border-radius:1px; }
+h3 { font-size: 0.82rem; margin-bottom: 6px; color: var(--text2); font-weight: 600; }
+
+/* Header */
+.header {
+  text-align: center;
+  margin-bottom: 16px;
+  padding: 20px 0 12px;
+}
+.header .logo {
+  display: inline-flex; align-items: center; gap: 10px;
+  background: linear-gradient(135deg, #f0b90b20, #2955E720);
+  border: 1px solid var(--border);
+  border-radius: 40px;
+  padding: 8px 24px;
+  margin-bottom: 8px;
+}
+.header .logo .dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 10px var(--green);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+.header h1 { background: linear-gradient(135deg, #f0b90b, #0ecb81); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.header .ts { color: var(--muted); font-size: 0.7rem; margin-top: 4px; }
+
+/* Cards */
+.balances {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 8px;
+  text-align: center;
+  transition: border-color .2s;
+}
+.card:hover { border-color: #334155; }
+.card .label { font-size: 0.6rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.card .value { font-size: 0.85rem; font-weight: 700; margin-top: 3px; }
+.stats {
+  display: flex; flex-wrap: wrap; gap: 8px 20px;
+  justify-content: center; font-size: 0.7rem; color: var(--text2);
+  margin-bottom: 12px; padding: 10px;
+  background: var(--surface); border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.stats b { color: var(--text); font-weight: 600; }
+
+/* Sections */
+.section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+/* Position */
+.position {
+  display: flex; flex-wrap: wrap; gap: 8px 16px;
+  align-items: center; font-size: 0.8rem;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface2);
+}
+.position.reverse { border-left: 3px solid var(--orange); }
+.position.forward { border-left: 3px solid var(--blue); }
+
+/* Badges */
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 0.6rem; font-weight: 700; letter-spacing: 0.3px;
+}
+.badge.reverse { background: #f0a03022; color: var(--orange); border:1px solid #f0a03044; }
+.badge.forward { background: #4090e022; color: var(--blue); border:1px solid #4090e044; }
+.badge.cross { background: #a855f722; color: var(--purple); border:1px solid #a855f744; }
+.badge.bn { background: #f0b90b22; color: var(--bn); border:1px solid #f0b90b44; }
+.badge.gt { background: #2955E722; color: #6b9fff; border:1px solid #2955E744; }
+.pass { color: var(--green); font-weight: bold; font-size:1.1em; }
+.fail { color: var(--red); }
+
+/* Tables */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--radius-sm); }
+table { width: 100%; border-collapse: collapse; font-size: 0.72rem; white-space: nowrap; }
+thead th {
+  color: var(--muted); font-weight: 600; font-size: 0.65rem;
+  text-transform: uppercase; letter-spacing: 0.5px;
+  padding: 8px 6px; background: var(--surface2);
+  position: sticky; top: 0; z-index: 1;
+}
+tbody td { padding: 6px; border-bottom: 1px solid #1a1a2e; }
+tbody tr:hover { background: #ffffff04; }
+tr.held { background: #0ecb8108; }
+tr.held:hover { background: #0ecb8112; }
+tr.cross-group { border-top: 2px solid #2a2a40; }
+tr.cross-group td { padding-top: 10px; }
+tr.cross-sub td { color: var(--text2); font-size: 0.68rem; padding: 2px 6px; }
+tr.cross-sub td:first-child { padding-left: 18px; }
+
+/* Calendar */
+.calendar { width: 100%; }
+.calendar td {
+  text-align: center; padding: 5px 3px; font-size: 0.75rem;
+  border-radius: 6px; cursor: default;
+}
+.calendar td small { display: block; margin-top: 1px; }
+.cal-nav {
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text2); border-radius: 6px; padding: 4px 10px;
+  font-size: 0.75rem; cursor: pointer;
+}
+.cal-nav:hover { background: var(--border); color: var(--text); }
+#calTitle { display: inline-block; min-width: 130px; text-align: center; font-weight:600; }
+
+/* Helpers */
+.right { text-align: right; }
+.center { text-align: center; }
+.positive { color: var(--green); font-weight: 600; }
+.negative { color: var(--red); font-weight: 600; }
+.muted { color: var(--muted); }
+
+.footer {
+  text-align: center; color: #2a2a40; font-size: 0.65rem;
+  margin-top: 16px; padding-bottom: 20px;
+}
+
+/* Mobile */
+@media (max-width: 600px) {
+  body { padding: 8px; }
+  .balances { grid-template-columns: repeat(4, 1fr); gap: 5px; }
+  .card { padding: 7px 4px; }
+  .card .value { font-size: 0.75rem; }
+  .card .label { font-size: 0.55rem; }
+  .section { padding: 10px; }
+  table { font-size: 0.64rem; }
+  thead th { font-size: 0.6rem; padding: 6px 4px; }
+  tbody td { padding: 4px; }
+  .header .logo { padding: 6px 16px; }
+  h1 { font-size: 1.1rem; }
+  .stats { gap: 4px 10px; font-size: 0.64rem; }
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo">
+    <span class="dot"></span>
+    <h1>ArbiBot 套利看板</h1>
+  </div>
+  <div class="ts">更新 $now_str · 30s 自动刷新</div>
+</div>
+$balance_cards
+$stats_html
+$position_html
+$calendar_html
+$chart_section
+$recent_html
+$table_html
+$cross_table_html
+<div class="footer">ArbiBot &copy; 2026 · Binance + Gate.io</div>
+
+<script>
+// ── 月历渲染 ──
+var ALL_PNL = $pnl_json;
+var TODAY = "$today_iso";
+var calYear = new Date().getFullYear();
+var calMonth = new Date().getMonth() + 1; // 1-12
+
+function renderCal(y, m) {
+    document.getElementById('calTitle').textContent = y + '年' + m + '月';
+    var fd = new Date(y, m - 1, 1).getDay(); // 0=Sun
+    fd = fd === 0 ? 6 : fd - 1; // Mon=0
+    var days = new Date(y, m, 0).getDate();
+    var html = '<tr><th>一</th><th>二</th><th>三</th><th>四</th><th>五</th><th>六</th><th>日</th></tr><tr>';
+    for (var i = 0; i < fd; i++) html += '<td></td>';
+    for (var d = 1; d <= days; d++) {
+        var ds = y + '-' + String(m).padStart(2,'0') + '-' + String(d).padStart(2,'0');
+        var pnl = ALL_PNL[ds] || 0;
+        var alpha = 0;
+        if (pnl > 0) alpha = Math.min(0.9, 0.2 + Math.abs(pnl) * 2);
+        else if (pnl < 0) alpha = Math.min(0.9, 0.2 + Math.abs(pnl) * 2);
+        var bg = pnl > 0 ? 'rgba(76,175,132,' + alpha + ')' : (pnl < 0 ? 'rgba(224,85,96,' + alpha + ')' : 'transparent');
+        var style = ds === TODAY ? 'border:2px solid #f0b90b;font-weight:700' : '';
+        html += '<td style="' + style + '"><div style="background:' + bg + ';border-radius:4px;padding:2px 4px">' + d + '<br><small style="font-size:0.55rem;color:#888">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '</small></div></td>';
+        var col = (fd + d) % 7;
+        if (col === 0 && d < days) html += '</tr><tr>';
+    }
+    html += '</tr>';
+    document.getElementById('calTable').innerHTML = html;
+}
+function navCal(dir) {
+    calMonth += dir;
+    if (calMonth < 1) { calMonth = 12; calYear--; }
+    if (calMonth > 12) { calMonth = 1; calYear++; }
+    renderCal(calYear, calMonth);
+}
+renderCal(calYear, calMonth);
+</script>
+$chart_js
+</body>
+</html>
