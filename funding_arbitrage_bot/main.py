@@ -15,16 +15,22 @@ async def main() -> None:
     parser.add_argument("--binance-only", action="store_true", help="单所期现套利，仅 Binance")
     parser.add_argument("--gate-only", action="store_true", help="单所期现套利，仅 Gate")
     parser.add_argument("--cross", action="store_true", help="跨交易所资金费率差套利")
+    parser.add_argument("--bn-snipe", action="store_true", help="Binance 资金费率狙击：裸合约单向持仓")
     args = parser.parse_args()
 
     single_exchange = args.binance_only or args.gate_only
+    mode_count = sum([args.cross, single_exchange, args.bn_snipe])
 
-    if args.cross and single_exchange:
-        parser.error("--cross 不能与 --binance-only / --gate-only 同时使用")
-    if not args.cross and not single_exchange:
-        parser.error("请选择运行模式: --binance-only / --gate-only / --cross")
+    if mode_count != 1:
+        parser.error("请选择一种运行模式: --binance-only / --gate-only / --cross / --bn-snipe")
 
-    if args.cross:
+    if args.bn_snipe:
+        _c.BN_SNIPE_ENABLED = True
+        _c.BINANCE_TRADING_ENABLED = False
+        _c.GATE_TRADING_ENABLED = False
+        _c.CROSS_EXCHANGE_ENABLED = False
+        logger.info("运行模式: Binance 资金费率狙击")
+    elif args.cross:
         _c.BINANCE_TRADING_ENABLED = True
         _c.GATE_TRADING_ENABLED = True
         _c.CROSS_EXCHANGE_ENABLED = True

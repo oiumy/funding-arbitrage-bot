@@ -84,17 +84,18 @@ class DashboardMixin:
         short_notional = short_amount * short_entry if short_entry else 0
         long_notional = long_amount * long_entry if long_entry else 0
 
-        # 提取平仓成交价
+        # 提取平仓成交价（先用 WS 订单响应，失败则 REST 补齐）
         short_exit = self._extract_fill_price(short_close_order) if short_close_order else 0.0
         long_exit = self._extract_fill_price(long_close_order) if long_close_order else 0.0
 
-        # ── 查实际手续费（4 单并发：开空+平空+开多+平多）──
+        # ── 查实际手续费 + 平仓均价（4 单并发：开空+平空+开多+平多）──
         short_close_id = str(short_close_order.get("id", "")) if short_close_order else ""
         long_close_id = str(long_close_order.get("id", "")) if long_close_order else ""
         short_close_info = short_close_order.get("info") if short_close_order else None
         long_close_info = long_close_order.get("info") if long_close_order else None
 
-        s_open_fee, s_close_fee, l_open_fee, l_close_fee = await asyncio.gather(
+        (s_open_fee, _), (s_close_fee, s_close_avg), \
+        (l_open_fee, _), (l_close_fee, l_close_avg) = await asyncio.gather(
             self._query_order_actual_fee(cs.short_exchange, cs.short_symbol, cs.short_order_id or ""),
             self._query_order_actual_fee(cs.short_exchange, cs.short_symbol, short_close_id, short_close_info),
             self._query_order_actual_fee(cs.long_exchange, cs.long_symbol, cs.long_order_id or ""),
@@ -102,6 +103,12 @@ class DashboardMixin:
         )
         short_fee_actual = round(s_open_fee + s_close_fee, 6)
         long_fee_actual = round(l_open_fee + l_close_fee, 6)
+
+        # REST 补齐平仓均价（WS 响应可能缺失 fill_price）
+        if short_exit <= 0 and s_close_avg > 0:
+            short_exit = s_close_avg
+        if long_exit <= 0 and l_close_avg > 0:
+            long_exit = l_close_avg
 
         # 费率估算（仅当交易所查询失败时回退）
         bn_fee, gt_fee = getattr(self, "_dash_cross_fees", (0.00045, 0.00018))
@@ -131,12 +138,13 @@ class DashboardMixin:
 
         # ── 做空侧 PnL ──
         short_price_pnl = round(short_amount * (short_entry - short_exit), 6)
-        short_funding_pnl = round(short_actual_funding, 6) if short_actual_funding else round(short_notional * cs.short_rate, 6)
+        short_funding_pnl = round(short_actual_funding, 6) if short_actual_funding != 0.0 else round(short_notional * cs.short_rate, 6)
         short_net = round(short_price_pnl + short_funding_pnl - short_fee_actual, 6)
 
         # ── 做多侧 PnL ──
         long_price_pnl = round(long_amount * (long_exit - long_entry), 6)
-        long_funding_pnl = round(-long_actual_funding, 6) if long_actual_funding else round(-long_notional * cs.long_rate, 6)
+        # API 返回的 FUNDING_FEE income 已自带 PnL 符号（正=收到, 负=付出），无需再取反
+        long_funding_pnl = round(long_actual_funding, 6) if long_actual_funding != 0.0 else round(-long_notional * cs.long_rate, 6)
         long_net = round(long_price_pnl + long_funding_pnl - long_fee_actual, 6)
 
         net_pnl = round(short_net + long_net, 6)
@@ -147,6 +155,8 @@ class DashboardMixin:
             short_entry=short_entry, short_exit=short_exit,
             long_entry=long_entry, long_exit=long_exit,
             net_pnl=net_pnl,
+            short_notional=round(short_notional, 2),
+            long_notional=round(long_notional, 2),
             short_exchange=cs.short_exchange, short_price_pnl=short_price_pnl,
             short_funding_pnl=short_funding_pnl,
             short_fee=short_fee_actual, short_net=short_net,
@@ -289,6 +299,7 @@ class DashboardMixin:
         gate_spot = getattr(self, "_dash_gate_spot", 0.0)
         gate_df = getattr(self, "_dash_gate_df", pd.DataFrame())
         cross_df = getattr(self, "_dash_cross_df", pd.DataFrame())
+        snipe_df = getattr(self, "_dash_snipe_df", pd.DataFrame())
 
         now_str = datetime.now(tz=self.tz).strftime("%Y-%m-%d %H:%M:%S")
         now = datetime.now(tz=self.tz)
@@ -580,11 +591,15 @@ class DashboardMixin:
                     l_exit = h.get("long_exit") or 0
                     cd1 = f"{s_exit:.4f}" if s_exit else "-"
                     cd2 = f"{l_exit:.4f}" if l_exit else "-"
-                    # 分组头行：时间/类型/币种/数量 + 汇总净盈亏
+                    # 名义价值：优先用记录的 notional，否则用 amount * entry 估算
+                    snl = h.get("short_notional") or (float(h.get("amount", 0)) * float(h.get("short_entry", 0)))
+                    lnl = h.get("long_notional") or (float(h.get("amount", 0)) * float(h.get("long_entry", 0)))
+                    notional_str = f"~{snl:.0f}" if snl else "-"
+                    # 分组头行：时间/类型/币种/名义价值 + 汇总净盈亏
                     rows += (f'<tr class="cross-group"><td>{ts_short}</td>'
                              f'<td><span class="badge cross">跨所</span></td>'
                              f'<td>{h["coin"]}</td>'
-                             f'<td class="right">{amount_str}</td>'
+                             f'<td class="right">{notional_str}</td>'
                              f'<td class="right muted" colspan="3">平仓价 {short_ex}空{cd1} / {long_ex}多{cd2}</td>'
                              f'<td class="right {pnl_cls}"><b>{net_pnl:+.4f}</b></td></tr>')
                     s_cls = "bn" if short_ex == "binance" else "gt"
@@ -626,7 +641,7 @@ class DashboardMixin:
                              f'<td class="right">{amount_str}</td>'
                              f'<td class="right">-</td><td class="right">-</td><td class="right">-</td>'
                              f'<td class="right {pnl_cls}">{pnl:+.4f}</td></tr>')
-            header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">数量</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费</th><th class="right">净盈亏</th></tr>'
+            header = '<tr><th>时间</th><th>类型</th><th>币种</th><th class="right">价值(USDT)</th><th class="right">价格盈亏</th><th class="right">资费</th><th class="right">手续费</th><th class="right">净盈亏</th></tr>'
             recent_html = f"""
         <div class="section">
             <h2>历史交易 <span class="muted">(最近20笔)</span></h2>
@@ -830,6 +845,62 @@ class DashboardMixin:
 }})();
 </script>"""
 
+        # ── 狙击机会表格 ──
+        snipe_rows_html = ""
+        if not snipe_df.empty:
+            for _, row in snipe_df.head(10).iterrows():
+                rate = float(row.get("funding_rate", 0))
+                net_rate = float(row.get("net_rate", 0))
+                direction = str(row.get("direction", ""))
+                net_cls = "positive" if net_rate > 0 else "negative"
+                passes = row.get("passes", True)
+                pass_mark = "✓" if passes else "✗"
+                pass_cls = "pass" if passes else "fail"
+                nft = float(row.get("next_funding_time_ms", 0))
+                now_ms = time.time() * 1000
+                mins = max(0, (nft - now_ms) / 60000) if nft > 0 else -1
+                cd = f"{int(mins)}min" if mins >= 0 else "N/A"
+                settle_local = str(row.get("settle_local", "?")) if nft > 0 else "?"
+                vol = float(row.get("quote_volume", 0) or 0)
+                if vol >= 1_000_000:
+                    vol_str = f"{vol/1e6:.1f}M"
+                elif vol >= 1_000:
+                    vol_str = f"{vol/1e3:.0f}K"
+                else:
+                    vol_str = f"{vol:.0f}"
+                held = self._bn_snipe.is_open if getattr(self, '_bn_snipe', None) else False
+                held_mark = " ★" if held else ""
+                snipe_rows_html += f"""
+                <tr class="{'held' if held else ''}">
+                    <td><span class="{pass_cls}">{pass_mark}</span></td>
+                    <td>{str(row['base'])[:8]}{held_mark}</td>
+                    <td class="right">{float(row['futures_price']):.6f}</td>
+                    <td class="right">{rate*100:+.4f}%</td>
+                    <td class="right">{abs(rate)*100:.4f}%</td>
+                    <td class="right {net_cls}">{net_rate*100:+.4f}%</td>
+                    <td><span class="badge {'short' if direction=='short' else 'long'}">{direction.upper()}</span></td>
+                    <td class="right">{vol_str}</td>
+                    <td class="right">{cd}</td>
+                    <td class="right">{settle_local}</td>
+                </tr>"""
+        else:
+            snipe_rows_html = '<tr><td colspan="10" class="muted center">暂无狙击机会</td></tr>'
+
+        snipe_table_html = f"""
+        <div class="section">
+            <h2>Binance 资金费率狙击 <span class="muted">(裸合约, 无对冲)</span></h2>
+            <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>通过</th><th>币种</th><th class="right">合约价</th><th class="right">费率</th><th class="right">abs费率</th><th class="right">净收益</th><th>方向</th><th class="right">24h成交</th><th class="right">距结算</th><th class="right">结算</th>
+                    </tr>
+                </thead>
+                <tbody>{snipe_rows_html}</tbody>
+            </table>
+            </div>
+        </div>"""
+
         template = (_TEMPLATE_DIR / "dashboard.html").read_text(encoding="utf-8")
         html = _string_mod.Template(template).substitute(
             now_str=now_str,
@@ -841,6 +912,7 @@ class DashboardMixin:
             recent_html=recent_html,
             table_html=table_html,
             cross_table_html=cross_table_html,
+            snipe_table_html=snipe_table_html,
             pnl_json=pnl_json,
             today_iso=today_iso,
             labels_json=labels_json,

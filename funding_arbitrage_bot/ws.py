@@ -387,10 +387,23 @@ class WebSocketMixin:
             )
             logger.info("[交易WS] BN 交易 WS 长连接已建立")
             asyncio.create_task(self._read_bn_trade_ws())
+            asyncio.create_task(self._bn_trade_ws_ping())
         except Exception as exc:
             logger.warning("[交易WS] BN 交易 WS 建立失败: %s", exc)
 
 
+
+    async def _bn_trade_ws_ping(self) -> None:
+        """BN 交易 WS 心跳，每 3 分钟 ping 一次防断线。"""
+        while True:
+            await asyncio.sleep(180)
+            ws = getattr(self, "_bn_trade_ws", None)
+            if not ws or ws.closed:
+                break
+            try:
+                await ws.ping()
+            except Exception:
+                break
 
     async def _close_bn_trade_ws(self) -> None:
         """关闭 BN 交易 WS，取消所有等待中的订单。"""

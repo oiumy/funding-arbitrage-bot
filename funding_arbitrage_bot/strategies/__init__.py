@@ -4,3 +4,4 @@ from .bn_reverse import BnReverseStrategy
 from .gate_forward import GateForwardStrategy
 from .gate_reverse import GateReverseStrategy
 from .cross_exchange import CrossExchangeStrategy
+from .bn_snipe import BnSnipeStrategy

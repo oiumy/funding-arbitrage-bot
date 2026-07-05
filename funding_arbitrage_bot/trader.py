@@ -470,7 +470,7 @@ class TraderMixin:
                     return f * 1000 if f < 1e12 else f
             except (TypeError, ValueError):
                 pass
-        return 0.0
+        return 0
 
 
 
@@ -1094,23 +1094,28 @@ class TraderMixin:
 
     async def _query_order_actual_fee(self, exchange: str, symbol: str,
                                        order_id: str,
-                                       close_info: dict | None = None) -> float:
-        """查询实际成交手续费。
-        - Binance: GET /fapi/v1/userTrades?orderId=... 累加 commission
-        - Gate: 优先用 close_info["fee"]，否则 GET /futures/usdt/orders/{id}
+                                       close_info: dict | None = None) -> tuple[float, float]:
+        """查询实际成交手续费 + 成交均价。返回 (fee, avg_price)。
+        - Binance: GET /fapi/v1/userTrades?orderId=... 累加 commission + 加权均价
+        - Gate: 优先用 close_info，否则 GET /futures/usdt/orders/{id}
         """
         if not order_id or order_id in ("", "0", "verified", "verified_close"):
-            return 0.0
+            return 0.0, 0.0
         if exchange == "gate":
+            fee = 0.0
+            avg_price = 0.0
             if close_info:
                 fee = float(close_info.get("fee", 0) or 0)
-                if fee > 0:
-                    return fee
+                avg_price = float(close_info.get("fill_price", 0) or 0)
+                if fee > 0 and avg_price > 0:
+                    return fee, avg_price
             try:
                 resp = await self._gate_request(f"/futures/usdt/orders/{order_id}")
-                return float(resp.get("fee", 0) or 0)
+                fee = float(resp.get("fee", 0) or 0)
+                avg_price = float(resp.get("fill_price", 0) or 0)
+                return fee, avg_price
             except Exception:
-                return 0.0
+                return fee, avg_price
         # Binance
         try:
             clean = self._clean_futures_symbol(symbol)
@@ -1118,11 +1123,18 @@ class TraderMixin:
                 BINANCE_FUTURES_API, "/fapi/v1/userTrades",
                 {"symbol": clean, "orderId": int(order_id)},
             )
-            total = 0.0
+            total_fee = 0.0
+            total_qty = 0.0
+            total_quote = 0.0
             for t in (trades if isinstance(trades, list) else []):
-                total += abs(float(t.get("commission", 0) or 0))
-            return total
+                total_fee += abs(float(t.get("commission", 0) or 0))
+                qty = abs(float(t.get("qty", 0) or 0))
+                price = float(t.get("price", 0) or 0)
+                total_qty += qty
+                total_quote += qty * price
+            avg_price = total_quote / total_qty if total_qty > 0 else 0.0
+            return total_fee, avg_price
         except Exception:
-            return 0.0
+            return 0.0, 0.0
 
 

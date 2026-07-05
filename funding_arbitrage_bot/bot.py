@@ -13,7 +13,7 @@ from .dashboard import DashboardMixin
 if TYPE_CHECKING:
     from .strategies import (BnForwardStrategy, BnReverseStrategy,
                              GateForwardStrategy, GateReverseStrategy,
-                             CrossExchangeStrategy)
+                             CrossExchangeStrategy, BnSnipeStrategy)
 
 class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, TraderMixin, DashboardMixin):
     """Cross-exchange funding rate arbitrage bot."""
@@ -54,6 +54,7 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
         self._gate_forward: GateForwardStrategy | None = None
         self._gate_reverse: GateReverseStrategy | None = None
         self._cross: CrossExchangeStrategy | None = None
+        self._bn_snipe: BnSnipeStrategy | None = None
         self._gate_funding_amount: float = 0.0  # WS 检测到的实际资费
         # BN + Gate 交易 WS（持久连接，下单省 HTTP 握手 + to_thread 开销）
         self._bn_trade_ws: Any = None
@@ -154,7 +155,7 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
                     else:
                         logger.error("[初始化] %s load_markets 3 次均失败: %s", name, e)
         # 建立资费监听 + 交易 WS 长连接（Gate 资费监听复用交易 WS，不再单开连接）
-        if _c.CROSS_EXCHANGE_ENABLED:
+        if _c.CROSS_EXCHANGE_ENABLED or _c.BN_SNIPE_ENABLED:
             await asyncio.gather(
                 self._ensure_bn_funding_ws(),
                 self._ensure_bn_trade_ws(),
@@ -163,7 +164,7 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
         # 创建策略实例
         from .strategies import (BnForwardStrategy, BnReverseStrategy,
                                  GateForwardStrategy, GateReverseStrategy,
-                                 CrossExchangeStrategy)
+                                 CrossExchangeStrategy, BnSnipeStrategy)
         if BINANCE_TRADING_ENABLED:
             self._bn_forward = BnForwardStrategy(self)
             self._bn_reverse = BnReverseStrategy(self)
@@ -172,6 +173,8 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
             self._gate_reverse = GateReverseStrategy(self)
         if _c.CROSS_EXCHANGE_ENABLED:
             self._cross = CrossExchangeStrategy(self)
+        if _c.BN_SNIPE_ENABLED:
+            self._bn_snipe = BnSnipeStrategy(self)
 
 
     async def close(self) -> None:
@@ -688,6 +691,22 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
             self._record_balance_snapshot(bn_total, gt_total)
             self._write_dashboard()
             # 强制回收内存，防止 RSS 持续上涨
+            gc.collect()
+            self._log_memory()
+            return
+
+        # ── Binance 资金费率狙击模式 ──
+        if _c.BN_SNIPE_ENABLED:
+            await self._bn_snipe.run_cycle()
+            # 更新看板（狙击模式专用）
+            bal = getattr(self._bn_snipe, "_dash_balance", 0.0)
+            self._dash_futures_usdt = bal
+            self._dash_total_usdt = bal
+            self._dash_snipe_df = getattr(self._bn_snipe, "_dash_df", pd.DataFrame())
+            self._dash_df = pd.DataFrame()  # 单所表留空，狙击用独立表
+            self._dash_gate_spot = 0.0
+            self._dash_gate_df = pd.DataFrame()
+            self._write_dashboard()
             gc.collect()
             self._log_memory()
             return
@@ -1316,6 +1335,20 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
             except Exception as exc:
                 print(f"\n  [跨交易所] 扫描失败: {exc}")
 
+        # ── Binance 资金费率狙击扫描 ──
+        if _c.BN_SNIPE_ENABLED:
+            bn_bal = await self._cross_get_bn_futures_balance()
+            ref_usdt = bn_bal * _c.BN_SNIPE_POSITION_SIZE_RATIO * CROSS_LEVERAGE if bn_bal > 0 else 100.0
+            try:
+                df = await self._bn_snipe.scan(ref_usdt)
+                if df.empty:
+                    print("\n  [狙击] 未发现符合条件的币种。")
+                else:
+                    print(f"\n  [狙击] Binance 合约余额={bn_bal:.2f} USDT, 可用仓位≈{ref_usdt:.2f} USDT")
+                    self._bn_snipe._print_opportunity_table(df, ref_usdt)
+            except Exception as exc:
+                print(f"\n  [狙击] 扫描失败: {exc}")
+
     async def run_forever(self) -> None:
         """打卡模式主循环: 有持仓按实际结算时间平仓, 无持仓定时扫描。
         双循环: REST 快速轮询费率 (预借) + 60s 全量扫 (开平仓决策)。
@@ -1324,11 +1357,13 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
 
         if _c.CROSS_EXCHANGE_ENABLED:
             logger.info("启动完成，进入跨交易所套利循环：60s 全量决策（有持仓时 1s 守护）。")
+        elif _c.BN_SNIPE_ENABLED:
+            logger.info("启动完成，进入 Binance 资金费率狙击循环。")
         else:
             logger.info("启动完成，进入双循环: REST 费率轮询 + 60s 全量决策。")
 
         async def poller_loop():
-            if not _c.CROSS_EXCHANGE_ENABLED:
+            if not _c.CROSS_EXCHANGE_ENABLED and not _c.BN_SNIPE_ENABLED:
                 await self._run_ws_monitor()
 
         async def position_watchdog():
