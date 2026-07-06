@@ -45,6 +45,7 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
         self._funding_event = asyncio.Event()
         self._funding_session: aiohttp.ClientSession | None = None
         self._funding_ws: Any = None
+        self._funding_ws_lost_at: float = 0.0
         self._gate_funding_event = asyncio.Event()
         self._gate_funding_symbol: str = ""
         self._gate_funding_baseline: float = 0.0

@@ -31,15 +31,26 @@ class DashboardMixin:
 
 
     def _record_trade(self, coin: str, direction: str,
-                      profit_usdt: float, net_rate: float) -> None:
+                      profit_usdt: float, net_rate: float,
+                      *, amount: float = 0.0,
+                      price_pnl: float = 0.0,
+                      funding_pnl: float = 0.0,
+                      fee_total: float = 0.0) -> None:
         history = self._load_trade_history()
-        history.append({
+        record: dict[str, Any] = {
             "ts": datetime.now(tz=self.tz).isoformat(),
             "coin": coin,
             "direction": direction,
             "profit_usdt": round(profit_usdt, 6),
             "net_rate": round(net_rate, 6),
-        })
+        }
+        if amount:
+            record["amount"] = round(amount, 4)
+        if price_pnl or funding_pnl or fee_total:
+            record["price_pnl"] = round(price_pnl, 6)
+            record["funding_pnl"] = round(funding_pnl, 6)
+            record["fee_total"] = round(fee_total, 6)
+        history.append(record)
         if len(history) > 365:
             history = history[-365:]
         self.TRADE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)

@@ -2,7 +2,6 @@
 from __future__ import annotations
 import asyncio
 import json
-import socket
 import time
 from typing import Any
 
@@ -252,15 +251,8 @@ class WebSocketMixin:
                 logger.warning("[资费监听] listenKey 创建失败")
                 return
             if not self._funding_session:
-                class _Resolver:
-                    async def resolve(self, host, port=0, family=0):
-                        if host == "fstream.binance.com":
-                            return [{"hostname": host, "host": "52.69.16.71", "port": port,
-                                     "family": socket.AF_INET, "proto": 6, "flags": socket.AI_NUMERICHOST}]
-                        return [{"hostname": host, "host": host, "port": port,
-                                 "family": socket.AF_INET, "proto": 6, "flags": 0}]
-                    async def close(self): pass
-                connector = aiohttp.TCPConnector(resolver=_Resolver(), ssl=False)
+                # AWS 东京原生 DNS，不再硬编码 IP
+                connector = aiohttp.TCPConnector(ssl=False)
                 self._funding_session = aiohttp.ClientSession(connector=connector)
             ws_url = f"wss://fstream.binance.com/ws/{self._bn_listen_key}"
             self._funding_ws = await self._funding_session.ws_connect(ws_url)
@@ -303,16 +295,43 @@ class WebSocketMixin:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = _json.loads(msg.data)
                         if data.get("e") == "ACCOUNT_UPDATE":
+                            a = data.get("a", {})
+                            positions = a.get("P") or []
                             # 缓存所有持仓到 WS cache（开平仓验证免 REST）
-                            for p in (data.get("a", {}).get("P", []) or []):
+                            for p in positions:
                                 sym = p.get("s", "")
                                 ps = p.get("ps", "")
                                 if sym and ps:
                                     self._bn_ws_positions[f"{sym}|{ps}"] = abs(float(p.get("pa", 0) or 0))
-                            if data.get("a", {}).get("m") == "FUNDING_FEE":
+                            if a.get("m") == "FUNDING_FEE":
                                 logger.info("[资费监听] BN 资费已到账 @ %s",
                                            datetime.now(self.tz).strftime("%H:%M:%S.%f")[:-3])
+                                # 先发信号弹，再打审计日志 — 平仓链路零干扰
                                 self._funding_event.set()
+                                # ── 狙击联动：资费到账瞬间激活平仓信号 ──
+                                snipe = getattr(self, "_bn_snipe", None)
+                                if snipe and snipe.is_open:
+                                    # 用集合 O(1) 查仓而非 O(n) 遍历
+                                    pos_syms = {p.get("s", "") for p in positions}
+                                    if snipe.symbol in pos_syms:
+                                        # 将币安官方结算毫秒戳同步给策略层，供平仓端计算全链路穿透延迟
+                                        if binance_tx_ms is not None:
+                                            snipe.last_funding_tx_ms = int(binance_tx_ms)
+                                        snipe.ws_funding_arrived_event.set()
+                                # ── 资费对账审计：量化币安记账→我方收包的跨系统分发时差 ──
+                                recv_wall_ms = int(time.time() * 1000)
+                                recv_time_str = time.strftime("%H:%M:%S", time.localtime(recv_wall_ms / 1000))
+                                recv_time_str += f".{recv_wall_ms % 1000:03d}"
+                                binance_tx_ms = data.get("T") or data.get("E")
+                                if binance_tx_ms:
+                                    bn_time_str = time.strftime("%H:%M:%S", time.localtime(binance_tx_ms / 1000))
+                                    bn_time_str += f".{int(binance_tx_ms) % 1000:03d}"
+                                    internal_delay = recv_wall_ms - int(binance_tx_ms)
+                                    logger.info("[资费对账审计] 币安结算记账时间: %s | 我方收到推送时间: %s | 跨系统分发总时差: %dms",
+                                                bn_time_str, recv_time_str, internal_delay)
+                                else:
+                                    logger.info("[资费对账审计] 币安结算记账时间: N/A | 我方收到推送时间: %s | 跨系统分发总时差: N/A",
+                                                recv_time_str)
                         elif data.get("e") == "listenKeyExpired":
                             logger.warning("[资费监听] listenKey 过期，重连")
                             break
@@ -323,9 +342,11 @@ class WebSocketMixin:
                     logger.warning("[资费监听] BN WS 读取异常: %s", exc)
             # 断线重连
             self._funding_ws = None
+            self._funding_ws_lost_at = time.time()
             await asyncio.sleep(3)
             try:
                 await self._ensure_bn_funding_ws()
+                self._funding_ws_lost_at = 0.0
                 break  # _ensure 会创建新的 reader task
             except Exception:
                 logger.warning("[资费监听] BN WS 重连失败，3s后重试")

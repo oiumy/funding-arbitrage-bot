@@ -1,8 +1,10 @@
 """Binance 资金费率狙击: 裸合约单向持仓，收取极端费率后立即平仓。"""
 from __future__ import annotations
 import asyncio
+import csv
 import gc
 import time
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import pandas as pd
@@ -33,6 +35,10 @@ class BnSnipeStrategy:
         self._snipe_loop_guard: bool = False
         self.is_sniping: bool = False       # 并发穿透锁，防外部定时器重入
         self.current_delay_ms: float = _c.CROSS_SNIPER_CLOSE_DELAY_MS
+        self.ws_funding_arrived_event = asyncio.Event()  # WS 资费到账信号
+        self.last_funding_tx_ms: int = 0               # 币安官方结算毫秒戳，由 ws.py 写入
+        self.net_rate: float = 0.0
+        self.futures_fee: float = 0.0
 
     # ── 扫描 ───────────────────────────────────────────────
 
@@ -106,7 +112,7 @@ class BnSnipeStrategy:
             return pd.DataFrame()
 
         df = pd.DataFrame(rows)
-        df.sort_values("abs_rate", ascending=False, inplace=True)
+        df.sort_values(["next_funding_time_ms", "abs_rate"], ascending=[True, False], inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
 
@@ -143,6 +149,8 @@ class BnSnipeStrategy:
         self.next_funding_time_ms = nft
         self.entry_price = price
         self.funding_rate = rate
+        self.net_rate = float(args.get("net_rate", 0))
+        self.futures_fee = float(args.get("futures_fee", DEFAULT_FUTURES_TAKER_FEE))
         logger.info("[狙击] 开仓成功 %s: %s %.4f张 @ %.6f 费率=%.4f%% | 发送=%s | RTT=%.1fms",
                      symbol, direction, amount, price, rate * 100, send_str, rtt_ms)
         return True
@@ -182,6 +190,11 @@ class BnSnipeStrategy:
             return False, rtt_ms
 
         # 只有确认平仓成功后才清状态，防止幽灵裸仓
+        # 记录前先保存值
+        _sym, _amt, _entry, _dir = sym, amt, self.entry_price, d
+        _fee = self.futures_fee
+        _nft = self.next_funding_time_ms
+
         self.is_open = False
         self.symbol = ""
         self.amount = 0.0
@@ -189,9 +202,72 @@ class BnSnipeStrategy:
         self.next_funding_time_ms = 0.0
         self.entry_price = 0.0
         self.funding_rate = 0.0
+        self.net_rate = 0.0
+        self.futures_fee = 0.0
+
+        # 平仓后查 userTrades + income API，算完整利润：价格盈亏 + 资费 - 手续费
+        await asyncio.sleep(0.5)
+        try:
+            clean = self.bot._clean_futures_symbol(_sym)
+            now_ms = int(time.time() * 1000)
+            trades = await self.bot._binance_request(
+                BINANCE_FUTURES_API, "/fapi/v1/userTrades",
+                {"symbol": clean, "startTime": now_ms - 15000, "endTime": now_ms, "limit": 100},
+            )
+            buys: list[float] = []
+            sells: list[float] = []
+            total_commission = 0.0
+            commission_asset = ""
+            if isinstance(trades, list):
+                for t in trades:
+                    qty = float(t.get("qty", 0) or 0)
+                    if qty <= 0:
+                        continue
+                    price = float(t["price"])
+                    side = t.get("side", "")
+                    if side == "BUY":
+                        buys.append(price)
+                    elif side == "SELL":
+                        sells.append(price)
+                    comm = float(t.get("commission", 0) or 0)
+                    total_commission += comm
+                    if comm and not commission_asset:
+                        commission_asset = t.get("commissionAsset", "")
+
+            buy_avg = sum(buys) / len(buys) if buys else _entry
+            sell_avg = sum(sells) / len(sells) if sells else _entry
+            trade_count = len(buys) + len(sells)
+            logger.debug("[手续费] userTrades 返回 %d 笔 | commission 合计=%.8f %s",
+                          trade_count, total_commission, commission_asset)
+        except Exception as e:
+            logger.debug("[手续费] userTrades 查询失败: %s", e)
+            buy_avg = sell_avg = _entry
+            total_commission = 0.0
+
+        funding_income = await self.bot._query_bn_funding_amount(_sym, int(_nft))
+        # 若 API 未返回手续费，用费率估算兜底
+        if total_commission <= 0:
+            total_commission = _amt * _entry * 2 * _fee
+            logger.debug("[手续费] API 返回 0，用费率 %.4f%% 估算=%.6f",
+                          _fee * 100, total_commission)
+        price_pnl = _amt * (sell_avg - buy_avg)  # long买→卖, short卖→买，同公式
+        profit = price_pnl + funding_income - total_commission
+        net_rate = profit / (_amt * _entry) if _amt > 0 and _entry > 0 else 0.0
+
+        logger.info("[狙击] %s | 开仓价=%.6f 平仓价=%.6f | 价格盈亏=%.4f | 资费=%.4f | 手续费=%.4f | 净利=%.4f (%.4f%%)",
+                     _sym, buy_avg, sell_avg, price_pnl, funding_income, total_commission,
+                     profit, net_rate * 100)
+        if funding_income <= 0:
+            logger.warning("[狙击] 资费未到账！%s", _sym)
+
+        self.bot._record_trade(_sym, _dir, profit, net_rate,
+                                amount=_amt * _entry,
+                                price_pnl=price_pnl,
+                                funding_pnl=funding_income,
+                                fee_total=total_commission)
 
         logger.info("[狙击] 平仓成功 %s %s %.4f张 | 发送=%s | RTT=%.1fms",
-                     sym, d, amt, send_str, rtt_ms)
+                     _sym, _dir, _amt, send_str, rtt_ms)
         return True, rtt_ms
 
     # ── 辅助 ───────────────────────────────────────────────
@@ -215,6 +291,43 @@ class BnSnipeStrategy:
             self.is_open = False
             return False
         return True
+
+    # ── 性能黑匣子 ─────────────────────────────────────────
+
+    def _record_performance_to_csv(self, trigger_type: str, e2e_ms: int) -> None:
+        """本地黑匣子：每次狙击追加一行到 data/sniper_perf.csv，并输出累计表现大盘。"""
+        csv_path = Path("data/sniper_perf.csv")
+        file_exists = csv_path.exists()
+
+        row = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "symbol": self.symbol,
+            "funding_rate": f"{self.funding_rate:.6f}",
+            "trigger_type": trigger_type,
+            "e2e_latency_ms": str(e2e_ms),
+        }
+
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+        # 读历史数据，输出累计表现大盘
+        try:
+            all_rows: list[dict] = []
+            with open(csv_path, "r", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    all_rows.append(r)
+            total_runs = len(all_rows)
+            ws_rows = [r for r in all_rows if r.get("trigger_type") == "WS_TRIGGER"]
+            ws_wins = len(ws_rows)
+            ws_rate = (ws_wins / total_runs * 100) if total_runs > 0 else 0.0
+            avg_latency = sum(int(r["e2e_latency_ms"]) for r in ws_rows) / len(ws_rows) if ws_rows else 0.0
+            logger.info("[性能大盘] 📊 累计交火: %d 次 | WS 成功抢跑: %d 次 | 抢跑成功率: %.2f%% | WS 抢跑平均延迟: %.1fms",
+                        total_runs, ws_wins, ws_rate, avg_latency)
+        except Exception:
+            pass
 
     # ── 主循环 ─────────────────────────────────────────────
 
@@ -294,20 +407,8 @@ class BnSnipeStrategy:
                     settle_hour = time.localtime(nft_ms / 1000).tm_hour
                     interval_hours = int(chosen.get("interval_hours", DEFAULT_FUNDING_INTERVAL_HOURS))
 
-                    # ── 两段式时延: 宏观大盘 + 微观妖币加固 ──
-                    # 第一段: 按结算钟点锁定基础大盘延迟
-                    if settle_hour == 0:
-                        base_delay = 300.0  # 00:00 跨夜地狱: 全站日线收线+资产对账
-                    elif settle_hour in (8, 16):
-                        base_delay = 150.0  # 08/16 主力整点: 全站 8h+4h+2h+1h 齐结算
-                    else:
-                        base_delay = 80.0   # 4h/2h/1h 轻载节点
-
-                    # 第二段: 妖币局部队列加固 — 撮合队列瘫痪 + 清算账本遍历延迟
-                    if rate_abs >= 0.015:
-                        self.current_delay_ms = base_delay + 50.0
-                    else:
-                        self.current_delay_ms = base_delay
+                    # ── 死线兜底: WS 资费通知为主力，超时才走此兜底 ──
+                    self.current_delay_ms = 600.0 if rate_abs >= 0.015 else 400.0
 
                     logger.info("[狙击] 目标 %s | 节点 %02d:00 | 周期 %dh | 妖币=%s | 延时: %dms",
                                  str(chosen["symbol"]), settle_hour, interval_hours,
@@ -320,6 +421,8 @@ class BnSnipeStrategy:
                         "price": float(chosen["futures_price"]),
                         "nft": nft_ms,
                         "rate": float(chosen["funding_rate"]),
+                        "net_rate": float(chosen["net_rate"]),
+                        "futures_fee": float(chosen["futures_taker_fee"]),
                     }
 
                     # Step 2: T-2s 战术网络热身 → T-1s 开仓
@@ -340,24 +443,37 @@ class BnSnipeStrategy:
                     # 终极防线: 关闭 GC, 开仓→平仓这 1s 内绝不允许 GC 背刺
                     gc.disable()
                     try:
+                        # 开仓前擦净信号画布：确保 open 内或 open 后任何时刻到达的
+                        # FUNDING_FEE 都能被 wait_for 捕获，避免 clear() 放在 open
+                        # 之后抹杀已到达的 WS 信号。
+                        self.ws_funding_arrived_event.clear()
                         ok = await self.open_position_fast(fast_args)
 
                         if ok:
-                            # Step 3: 结算后 +delay_ms 混合自旋平仓
-                            snipe_sec = (snipe_ms + self.current_delay_ms) / 1000.0
-                            now_perf = time.perf_counter()
-                            now_wall = time.time()
-                            target_perf = now_perf + (snipe_sec - now_wall)
+                            # Step 3: WS资费到账 + 硬死线超时 双轨竞赛平仓
+                            hard_deadline = (snipe_ms + self.current_delay_ms) / 1000.0
+                            timeout = max(0.001, hard_deadline - time.time())
 
-                            get_perf = time.perf_counter  # 局部绑定, 零字典查找
+                            # 断线预警: 资费WS若在开仓后断开，只会走硬超时兜底
+                            lost_at = getattr(self.bot, "_funding_ws_lost_at", 0.0)
+                            if lost_at and time.time() - lost_at < 30:
+                                logger.warning("[狙击] 资费WS断线中 (%.0fs前)，将依赖硬死线兜底",
+                                               time.time() - lost_at)
 
-                            time_left_ms = (target_perf - get_perf()) * 1000
-                            if time_left_ms > 30:
-                                await asyncio.sleep((time_left_ms - 30) / 1000)
+                            try:
+                                await asyncio.wait_for(
+                                    self.ws_funding_arrived_event.wait(), timeout=timeout,
+                                )
+                                fire_wall_ms = int(time.time() * 1000)
+                                tx_ms = getattr(self, "last_funding_tx_ms", 0)
+                                total_e2e = fire_wall_ms - tx_ms if tx_ms else 0
+                                logger.info("[狙击] WS资费信号捷报！提前 %.0fms 触发平仓 | 穿透全链路(币安记账→平仓发单)总耗时: %dms",
+                                             (hard_deadline - time.time()) * 1000, total_e2e)
+                                self._record_performance_to_csv("WS_TRIGGER", total_e2e)
+                            except asyncio.TimeoutError:
+                                logger.warning("[狙击] WS超时，硬时钟强制执行平仓 | 死线已到")
+                                self._record_performance_to_csv("TIMEOUT_兜底", 0)
 
-                            # 用硬件单调时钟自旋, 比 time.time() 快数倍且零抖动
-                            while get_perf() < target_perf:
-                                pass
                             closed, pure_rtt = await self.close_position_fast()
                             logger.info("[延迟] 平仓纯净 RTT: %.1fms", pure_rtt)
                     finally:
@@ -386,7 +502,9 @@ class BnSnipeStrategy:
         self._print_opportunity_table(df, position_usdt)
 
         if not passing.empty:
+            # scan 已按 [结算时间↑, 费率↓] 排好序，直接取首位
             best = passing.iloc[0]
+
             self._next_snipe_settle_ms = float(best["next_funding_time_ms"])
             settle_local = str(best.get("settle_local", "?"))
             remain_min = float(best.get("remain_min", 0) or 0)
@@ -409,8 +527,22 @@ class BnSnipeStrategy:
                     self._snipe_loop_guard = False
 
     def _print_opportunity_table(self, df: pd.DataFrame, position_usdt: float) -> None:
-        """打印机会表格。"""
-        top = df.head(10)
+        """打印两张机会表格：时间优先 TOP3 + 费率优先 TOP3。"""
+        if df.empty:
+            return
+
+        t1 = df.sort_values(["next_funding_time_ms", "abs_rate"], ascending=[True, False]).head(3)
+        t2 = df.sort_values("abs_rate", ascending=False).head(3)
+
+        logger.info("  ═══════════════════════════════════════════════════════════════════")
+        logger.info("  币安资金费率狙击 (裸合约, 无对冲) — 可用 ≈%.0f USDT", position_usdt)
+        logger.info("  ═══════════════════════════════════════════════════════════════════")
+
+        self._print_table("按结算时间优先 (TOP 3)", t1)
+        self._print_table("按费率绝对值优先 (TOP 3)", t2)
+
+    def _print_table(self, title: str, top: pd.DataFrame) -> None:
+        """打印单张机会表。"""
         if top.empty:
             return
 
@@ -426,9 +558,7 @@ class BnSnipeStrategy:
                 return f"{int(m//60)}h{int(m%60):02d}m"
             return f"{int(m)}m"
 
-        logger.info("  ═══════════════════════════════════════════════════════════════════")
-        logger.info("  币安资金费率狙击 (裸合约, 无对冲) — 可用 ≈%.0f USDT", position_usdt)
-        logger.info("  ═══════════════════════════════════════════════════════════════════")
+        logger.info("  ── %s ──", title)
         logger.info("    %-10s %9s %8s %7s %7s %5s %7s %7s %6s %5s",
                     "币种", "价格", "费率%", "abs%", "净收益%", "方向",
                     "24h成交", "距结算", "结算", "通过")
@@ -450,4 +580,4 @@ class BnSnipeStrategy:
                         _fmt_remain(remain_m),
                         settle,
                         "✓" if row["passes"] else "✗")
-        logger.info("  ═══════════════════════════════════════════════════════════════════")
+        logger.info("")
