@@ -37,6 +37,8 @@ class BnSnipeStrategy:
         self.current_delay_ms: float = _c.CROSS_SNIPER_CLOSE_DELAY_MS
         self.ws_funding_arrived_event = asyncio.Event()  # WS 资费到账信号
         self.last_funding_tx_ms: int = 0               # 币安官方结算毫秒戳，由 ws.py 写入
+        self.last_funding_event_ms: int = 0            # 币安 WS 推送事件毫秒戳，由 ws.py 写入
+        self.last_funding_recv_ms: int = 0             # 本地收到 WS 推送毫秒戳，由 ws.py 写入
         self.net_rate: float = 0.0
         self.futures_fee: float = 0.0
 
@@ -268,6 +270,12 @@ class BnSnipeStrategy:
 
         logger.info("[狙击] 平仓成功 %s %s %.4f张 | 发送=%s | RTT=%.1fms",
                      _sym, _dir, _amt, send_str, rtt_ms)
+
+        # ── 全链路时间戳审计 ──
+        order = result.order or {}
+        fill_ts = order.get("transactTime", 0)
+        self._log_full_timeline(fill_ts, send_ts)
+
         return True, rtt_ms
 
     # ── 辅助 ───────────────────────────────────────────────
@@ -293,6 +301,24 @@ class BnSnipeStrategy:
         return True
 
     # ── 性能黑匣子 ─────────────────────────────────────────
+
+    def _log_full_timeline(self, fill_ts: int, send_ts: float) -> None:
+        """全链路时间戳审计：币安结算 → WS推送 → 本地收到 → 平仓发出 → 订单成交。"""
+        ts = {
+            "A_结算": self.last_funding_tx_ms,
+            "B_WS推送": self.last_funding_event_ms,
+            "C_本地收到": self.last_funding_recv_ms,
+            "D_平仓发出": int(send_ts * 1000),
+            "E_订单成交": int(fill_ts),
+        }
+        # 只打有效时间戳
+        valid = {k: v for k, v in ts.items() if v > 0}
+        if len(valid) < 2:
+            return
+        sorted_ts = sorted(valid.values())
+        base = sorted_ts[0]
+        timeline = " → ".join(f"{k}={v - base:+d}ms" for k, v in ts.items() if v > 0)
+        logger.info("[全链路] %s", timeline)
 
     def _record_performance_to_csv(self, trigger_type: str, e2e_ms: int) -> None:
         """本地黑匣子：每次狙击追加一行到 data/sniper_perf.csv，并输出累计表现大盘。"""
@@ -447,6 +473,8 @@ class BnSnipeStrategy:
                         # FUNDING_FEE 都能被 wait_for 捕获，避免 clear() 放在 open
                         # 之后抹杀已到达的 WS 信号。
                         self.ws_funding_arrived_event.clear()
+                        # 诊断: 结算±5s窗口内转储全部WS原始JSON，定位FUNDING_FEE根因
+                        self.bot._funding_raw_dump_until = time.time() + 10
                         ok = await self.open_position_fast(fast_args)
 
                         if ok:

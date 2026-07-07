@@ -43,9 +43,10 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
         self._bn_listen_key: str | None = None
         self._bn_listen_key_ts: float = 0.0
         self._funding_event = asyncio.Event()
-        self._funding_session: aiohttp.ClientSession | None = None
-        self._funding_ws: Any = None
         self._funding_ws_lost_at: float = 0.0
+        self._funding_raw_dump_until: float = 0.0  # 诊断: 结算窗口内转储WS原始JSON
+        self._funding_ws_seen_types: set = set()   # 诊断: 资费WS收到过的事件类型
+        self._funding_seen_reasons: set = set()   # 诊断: ACCOUNT_UPDATE 已见过的 m 类型
         self._gate_funding_event = asyncio.Event()
         self._gate_funding_symbol: str = ""
         self._gate_funding_baseline: float = 0.0
@@ -61,6 +62,8 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
         self._bn_trade_ws: Any = None
         self._bn_trade_session: aiohttp.ClientSession | None = None
         self._bn_trade_futures: dict[str, asyncio.Future] = {}
+        self._bn_user_data_ws: Any = None
+        self._bn_user_data_session: aiohttp.ClientSession | None = None
         self._gate_trade_ws: Any = None
         self._gate_trade_session: aiohttp.ClientSession | None = None
         self._gate_trade_futures: dict[str, asyncio.Future] = {}
@@ -155,12 +158,17 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
                         raise
                     else:
                         logger.error("[初始化] %s load_markets 3 次均失败: %s", name, e)
-        # 建立资费监听 + 交易 WS 长连接（Gate 资费监听复用交易 WS，不再单开连接）
-        if _c.CROSS_EXCHANGE_ENABLED or _c.BN_SNIPE_ENABLED:
+        # 建立 WS 长连接
+        if _c.CROSS_EXCHANGE_ENABLED:
             await asyncio.gather(
-                self._ensure_bn_funding_ws(),
                 self._ensure_bn_trade_ws(),
+                self._ensure_bn_user_data_ws(),
                 self._ensure_gate_trade_ws(),
+            )
+        elif _c.BN_SNIPE_ENABLED:
+            await asyncio.gather(
+                self._ensure_bn_trade_ws(),
+                self._ensure_bn_user_data_ws(),
             )
         # 创建策略实例
         from .strategies import (BnForwardStrategy, BnReverseStrategy,
@@ -187,12 +195,11 @@ class FundingArbitrageBot(WebSocketMixin, ExchangeRestMixin, ScannerMixin, Trade
             self._safe_request("gate_spot.close", lambda: self.gate_spot.close()),
             self._safe_request("gate_futures.close", lambda: self.gate_futures.close()),
         )
-        await self._close_bn_funding_ws()
         await self._close_bn_trade_ws()
+        await self._close_bn_user_data_ws()
         await self._close_gate_trade_ws()
         # 清理 aiohttp session
-        for attr in ("_funding_session",
-                      "_bn_trade_session", "_gate_trade_session"):
+        for attr in ("_bn_trade_session", "_bn_user_data_session", "_gate_trade_session"):
             sess = getattr(self, attr, None)
             if sess:
                 try:

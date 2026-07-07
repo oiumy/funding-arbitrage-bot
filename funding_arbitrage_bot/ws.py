@@ -230,128 +230,67 @@ class WebSocketMixin:
 
 
 
-    # ── from bot.py lines 913-1466 ──
-    async def _ensure_bn_funding_ws(self) -> None:
-        """确保 BN 用户数据流 WS 长连接存活（断线自动重连）。
-        启动时调用一次，之后持续监听 FUNDING_FEE 事件。"""
-        ws = getattr(self, "_funding_ws", None)
+    # ════════════════════════════════════════════════════════════════
+    # BN 交易 WS（下单专用，wss://ws-fapi.binance.com/ws-fapi/v1）
+    # ════════════════════════════════════════════════════════════════
+
+    async def _ensure_bn_trade_ws(self) -> None:
+        """确保 BN 交易 WS 长连接（仅用于下单），断线自动重连。"""
+        ws = getattr(self, "_bn_trade_ws", None)
         if ws and not ws.closed:
-            # 每 45min 刷新 listenKey（60min 有效期）
-            if time.time() - getattr(self, "_bn_listen_key_ts", 0) < 2700:
-                return
-            logger.info("[资费监听] listenKey 即将过期，刷新")
-            await self._close_bn_funding_ws()
+            return
+        await self._close_bn_trade_ws()
         try:
-            resp = await self._binance_request(
-                BINANCE_FUTURES_API, "/fapi/v1/listenKey", {}, method="POST",
+            if not self._bn_trade_session:
+                self._bn_trade_session = aiohttp.ClientSession()
+            self._bn_trade_ws = await self._bn_trade_session.ws_connect(
+                "wss://ws-fapi.binance.com/ws-fapi/v1"
             )
-            self._bn_listen_key = resp.get("listenKey", "")
-            self._bn_listen_key_ts = time.time()
-            if not self._bn_listen_key:
-                logger.warning("[资费监听] listenKey 创建失败")
-                return
-            if not self._funding_session:
-                # AWS 东京原生 DNS，不再硬编码 IP
-                connector = aiohttp.TCPConnector(ssl=False)
-                self._funding_session = aiohttp.ClientSession(connector=connector)
-            ws_url = f"wss://fstream.binance.com/ws/{self._bn_listen_key}"
-            self._funding_ws = await self._funding_session.ws_connect(ws_url)
-            logger.info("[资费监听] BN WS 长连接已建立")
-            asyncio.create_task(self._read_bn_funding_stream())
+            logger.info("[交易WS] BN 交易 WS 长连接已建立")
+            asyncio.create_task(self._read_bn_trade_ws())
+            asyncio.create_task(self._bn_trade_ws_ping())
         except Exception as exc:
-            logger.warning("[资费监听] BN WS 建立失败: %s", exc)
+            logger.warning("[交易WS] BN 交易 WS 建立失败: %s", exc)
 
 
+    # ════════════════════════════════════════════════════════════════
+    # BN 用户数据流 WS（资费/账户事件推送，wss://fstream.binance.com/private/ws）
+    # 币安 2026-04 起废弃旧 URL，新 URL 需显式指定 events 参数 太扫码了
+    # ════════════════════════════════════════════════════════════════
 
-    async def _close_bn_funding_ws(self) -> None:
-        """关闭 BN WS 长连接。"""
+    async def _ensure_bn_user_data_ws(self) -> None:
+        """确保 BN 用户数据流 WS 连接，断线自动重连。"""
+        ws = getattr(self, "_bn_user_data_ws", None)
+        if ws and not ws.closed:
+            return
+        await self._close_bn_user_data_ws()
         try:
-            ws = getattr(self, "_funding_ws", None)
-            if ws:
-                await ws.close()
-                self._funding_ws = None
-        except Exception:
-            pass
-        try:
-            if self._bn_listen_key:
-                await self._binance_request(
-                    BINANCE_FUTURES_API, "/fapi/v1/listenKey", {}, method="DELETE",
+            # Step 1: 获取 listenKey
+            if not self._bn_listen_key or time.time() - getattr(self, "_bn_listen_key_ts", 0) >= 2700:
+                resp = await self._binance_request(
+                    BINANCE_FUTURES_API, "/fapi/v1/listenKey", {}, method="POST",
                 )
-                self._bn_listen_key = None
-        except Exception:
-            pass
+                self._bn_listen_key = resp.get("listenKey", "")
+                self._bn_listen_key_ts = time.time()
+                if not self._bn_listen_key:
+                    logger.warning("[用户数据WS] listenKey 创建失败")
+                    return
 
+            # Step 2: 连接用户数据流 WS（新 URL，显式指定 events）
+            if not self._bn_user_data_session:
+                self._bn_user_data_session = aiohttp.ClientSession()
+            url = (f"wss://fstream.binance.com/private/ws"
+                   f"?listenKey={self._bn_listen_key}"
+                   f"&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE")
+            self._bn_user_data_ws = await self._bn_user_data_session.ws_connect(url)
+            logger.info("[用户数据WS] BN 用户数据流已连接")
 
-
-    async def _read_bn_funding_stream(self) -> None:
-        """持久读 BN 用户数据流，检测 FUNDING_FEE 设 event，断线自动重连。"""
-        import json as _json
-        while True:
-            try:
-                ws = getattr(self, "_funding_ws", None)
-                if not ws or ws.closed:
-                    break
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = _json.loads(msg.data)
-                        if data.get("e") == "ACCOUNT_UPDATE":
-                            a = data.get("a", {})
-                            positions = a.get("P") or []
-                            # 缓存所有持仓到 WS cache（开平仓验证免 REST）
-                            for p in positions:
-                                sym = p.get("s", "")
-                                ps = p.get("ps", "")
-                                if sym and ps:
-                                    self._bn_ws_positions[f"{sym}|{ps}"] = abs(float(p.get("pa", 0) or 0))
-                            if a.get("m") == "FUNDING_FEE":
-                                logger.info("[资费监听] BN 资费已到账 @ %s",
-                                           datetime.now(self.tz).strftime("%H:%M:%S.%f")[:-3])
-                                # 先发信号弹，再打审计日志 — 平仓链路零干扰
-                                self._funding_event.set()
-                                # ── 狙击联动：资费到账瞬间激活平仓信号 ──
-                                snipe = getattr(self, "_bn_snipe", None)
-                                if snipe and snipe.is_open:
-                                    # 用集合 O(1) 查仓而非 O(n) 遍历
-                                    pos_syms = {p.get("s", "") for p in positions}
-                                    if snipe.symbol in pos_syms:
-                                        # 将币安官方结算毫秒戳同步给策略层，供平仓端计算全链路穿透延迟
-                                        if binance_tx_ms is not None:
-                                            snipe.last_funding_tx_ms = int(binance_tx_ms)
-                                        snipe.ws_funding_arrived_event.set()
-                                # ── 资费对账审计：量化币安记账→我方收包的跨系统分发时差 ──
-                                recv_wall_ms = int(time.time() * 1000)
-                                recv_time_str = time.strftime("%H:%M:%S", time.localtime(recv_wall_ms / 1000))
-                                recv_time_str += f".{recv_wall_ms % 1000:03d}"
-                                binance_tx_ms = data.get("T") or data.get("E")
-                                if binance_tx_ms:
-                                    bn_time_str = time.strftime("%H:%M:%S", time.localtime(binance_tx_ms / 1000))
-                                    bn_time_str += f".{int(binance_tx_ms) % 1000:03d}"
-                                    internal_delay = recv_wall_ms - int(binance_tx_ms)
-                                    logger.info("[资费对账审计] 币安结算记账时间: %s | 我方收到推送时间: %s | 跨系统分发总时差: %dms",
-                                                bn_time_str, recv_time_str, internal_delay)
-                                else:
-                                    logger.info("[资费对账审计] 币安结算记账时间: N/A | 我方收到推送时间: %s | 跨系统分发总时差: N/A",
-                                                recv_time_str)
-                        elif data.get("e") == "listenKeyExpired":
-                            logger.warning("[资费监听] listenKey 过期，重连")
-                            break
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        break
-            except Exception as exc:
-                if "Connection" not in str(exc) and "closed" not in str(exc).lower():
-                    logger.warning("[资费监听] BN WS 读取异常: %s", exc)
-            # 断线重连
-            self._funding_ws = None
-            self._funding_ws_lost_at = time.time()
-            await asyncio.sleep(3)
-            try:
-                await self._ensure_bn_funding_ws()
-                self._funding_ws_lost_at = 0.0
-                break  # _ensure 会创建新的 reader task
-            except Exception:
-                logger.warning("[资费监听] BN WS 重连失败，3s后重试")
-                await asyncio.sleep(3)
-
+            # Step 3: 启动后台任务
+            asyncio.create_task(self._read_bn_user_data_ws())
+            asyncio.create_task(self._bn_user_data_ping())
+            asyncio.create_task(self._renew_bn_listen_key_loop())
+        except Exception as exc:
+            logger.warning("[用户数据WS] 连接失败: %s", exc)
 
 
     async def _gate_subscribe_position(self, contract: str) -> bool:
@@ -388,36 +327,10 @@ class WebSocketMixin:
             return False
 
 
-    # ════════════════════════════════════════════════════════════════
-    # BN + Gate 交易 WS（持久长连接，下单省 HTTP 握手 + to_thread）
-    # ════════════════════════════════════════════════════════════════
-
-
-
-    async def _ensure_bn_trade_ws(self) -> None:
-        """确保 BN 交易 WS 长连接存活（wss://ws-fapi.binance.com/ws-fapi/v1），断线自动重连。"""
-        ws = getattr(self, "_bn_trade_ws", None)
-        if ws and not ws.closed:
-            return
-        await self._close_bn_trade_ws()
-        try:
-            if not self._bn_trade_session:
-                self._bn_trade_session = aiohttp.ClientSession()
-            self._bn_trade_ws = await self._bn_trade_session.ws_connect(
-                "wss://ws-fapi.binance.com/ws-fapi/v1"
-            )
-            logger.info("[交易WS] BN 交易 WS 长连接已建立")
-            asyncio.create_task(self._read_bn_trade_ws())
-            asyncio.create_task(self._bn_trade_ws_ping())
-        except Exception as exc:
-            logger.warning("[交易WS] BN 交易 WS 建立失败: %s", exc)
-
-
-
     async def _bn_trade_ws_ping(self) -> None:
-        """BN 交易 WS 心跳，每 3 分钟 ping 一次防断线。"""
+        """BN 交易 WS 心跳，每 50 秒 ping 一次防断线。"""
         while True:
-            await asyncio.sleep(180)
+            await asyncio.sleep(50)
             ws = getattr(self, "_bn_trade_ws", None)
             if not ws or ws.closed:
                 break
@@ -426,8 +339,23 @@ class WebSocketMixin:
             except Exception:
                 break
 
+    async def _renew_bn_listen_key_loop(self) -> None:
+        """每 45 分钟 PUT /fapi/v1/listenKey 续期，防止 listenKey 过期（60min 有效期）。"""
+        while True:
+            await asyncio.sleep(2700)
+            if not self._bn_listen_key:
+                break
+            try:
+                await self._binance_request(
+                    BINANCE_FUTURES_API, "/fapi/v1/listenKey", {}, method="PUT",
+                )
+                self._bn_listen_key_ts = time.time()
+                logger.info("[用户数据WS] listenKey 续期成功")
+            except Exception as exc:
+                logger.warning("[用户数据WS] listenKey 续期失败: %s", exc)
+
     async def _close_bn_trade_ws(self) -> None:
-        """关闭 BN 交易 WS，取消所有等待中的订单。"""
+        """关闭 BN 交易 WS。"""
         try:
             ws = getattr(self, "_bn_trade_ws", None)
             if ws:
@@ -439,10 +367,28 @@ class WebSocketMixin:
             if not fut.done():
                 fut.set_exception(Exception("BN trade WS closed"))
 
+    async def _close_bn_user_data_ws(self) -> None:
+        """关闭 BN 用户数据流 WS + 清理 listenKey。"""
+        try:
+            ws = getattr(self, "_bn_user_data_ws", None)
+            if ws:
+                await ws.close()
+                self._bn_user_data_ws = None
+        except Exception:
+            pass
+        try:
+            if self._bn_listen_key:
+                await self._binance_request(
+                    BINANCE_FUTURES_API, "/fapi/v1/listenKey", {}, method="DELETE",
+                )
+                self._bn_listen_key = None
+        except Exception:
+            pass
+
 
 
     async def _read_bn_trade_ws(self) -> None:
-        """持久读 BN 交易 WS 响应，按 id 分发到对应 Future，断线自动重连。"""
+        """读取 BN 交易 WS 响应：仅处理下单回执，断线自动重连。"""
         import json as _json
         while True:
             try:
@@ -450,20 +396,24 @@ class WebSocketMixin:
                 if not ws or ws.closed:
                     break
                 async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = _json.loads(msg.data)
-                        rid = data.get("id", "")
-                        if rid in getattr(self, "_bn_trade_futures", {}):
-                            fut = self._bn_trade_futures.pop(rid)
-                            if not fut.done():
-                                if data.get("status") == 200:
-                                    fut.set_result(data.get("result", {}))
-                                else:
-                                    err = data.get("error", {})
-                                    fut.set_exception(
-                                        Exception(f"BN WS order failed: {err}"))
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        break
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+                        continue
+                    data = _json.loads(msg.data)
+
+                    # 下单回执（id 匹配订单 Future）
+                    rid = data.get("id", "")
+                    if rid and rid in getattr(self, "_bn_trade_futures", {}):
+                        fut = self._bn_trade_futures.pop(rid)
+                        if not fut.done():
+                            if data.get("status") == 200:
+                                fut.set_result(data.get("result", {}))
+                            else:
+                                err = data.get("error", {})
+                                fut.set_exception(
+                                    Exception(f"BN WS order failed: {err}"))
+
             except Exception as exc:
                 if "Connection" not in str(exc) and "closed" not in str(exc).lower():
                     logger.warning("[交易WS] BN 交易 WS 读取异常: %s", exc)
@@ -479,6 +429,141 @@ class WebSocketMixin:
                 break
             except Exception:
                 await asyncio.sleep(3)
+
+    async def _read_bn_user_data_ws(self) -> None:
+        """读取 BN 用户数据流：ACCOUNT_UPDATE 资费检测 + 持仓缓存，断线自动重连。"""
+        import json as _json
+        while True:
+            try:
+                ws = getattr(self, "_bn_user_data_ws", None)
+                if not ws or ws.closed:
+                    break
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+                        continue
+                    data = _json.loads(msg.data)
+
+                    e_type = data.get("e", "")
+                    if not e_type:
+                        continue
+
+                    # 诊断: 事件类型去重日志
+                    seen = getattr(self, "_funding_ws_seen_types", set())
+                    if e_type not in seen:
+                        seen.add(e_type)
+                        self._funding_ws_seen_types = seen
+                        logger.info("[资费诊断-WS存活] 新事件类型: %s | 累计: %s",
+                                   e_type, sorted(seen))
+
+                    # RAW dump（结算窗口内）
+                    if time.time() < getattr(self, "_funding_raw_dump_until", 0):
+                        logger.info("[资费诊断-RAW] %s", msg.data)
+
+                    if e_type == "ACCOUNT_UPDATE":
+                        a = data.get("a", {})
+                        positions = a.get("P") or []
+                        for p in positions:
+                            sym = p.get("s", "")
+                            ps = p.get("ps", "")
+                            if sym and ps:
+                                self._bn_ws_positions[f"{sym}|{ps}"] = abs(
+                                    float(p.get("pa", 0) or 0))
+
+                        reason = a.get("m", "")
+                        balances = a.get("B") or []
+                        binance_tx_ms = data.get("T") or data.get("E")
+
+                        # ── 双轨资费检测 ──
+                        funding_detected = False
+                        detection_label = ""
+
+                        if reason == "FUNDING_FEE":
+                            funding_detected = True
+                            detection_label = "m=FUNDING_FEE"
+                        elif balances:
+                            for b in balances:
+                                bc = float(b.get("bc", 0) or 0)
+                                if bc != 0.0 and reason not in (
+                                    "ORDER", "DEPOSIT", "WITHDRAW",
+                                    "MARGIN_TRANSFER", "ASSET_TRANSFER",
+                                ):
+                                    funding_detected = True
+                                    detection_label = f"m={reason}, bc={bc}"
+                                    break
+
+                        if funding_detected:
+                            recv_wall_ms = int(time.time() * 1000)
+                            recv_time_str = time.strftime(
+                                "%H:%M:%S", time.localtime(recv_wall_ms / 1000))
+                            recv_time_str += f".{recv_wall_ms % 1000:03d}"
+                            logger.info("[资费监听] BN 资费已到账 @ %s | 检测方式=%s",
+                                       datetime.now(self.tz).strftime("%H:%M:%S.%f")[:-3],
+                                       detection_label)
+                            self._funding_event.set()
+                            snipe = getattr(self, "_bn_snipe", None)
+                            if snipe is not None:
+                                snipe.last_funding_tx_ms = int(binance_tx_ms) if binance_tx_ms else 0
+                                snipe.last_funding_event_ms = int(data.get("E", 0))
+                                snipe.last_funding_recv_ms = recv_wall_ms
+                                snipe.ws_funding_arrived_event.set()
+                            if binance_tx_ms:
+                                bn_time_str = time.strftime(
+                                    "%H:%M:%S", time.localtime(int(binance_tx_ms) / 1000))
+                                bn_time_str += f".{int(binance_tx_ms) % 1000:03d}"
+                                logger.info("[资费对账审计] 币安结算记账: %s | 我方收到: %s | 跨系统时差: %dms",
+                                           bn_time_str, recv_time_str,
+                                           recv_wall_ms - int(binance_tx_ms))
+                            else:
+                                logger.info("[资费对账审计] 币安结算记账: N/A | 我方收到: %s",
+                                           recv_time_str)
+                        else:
+                            seen_reasons = getattr(self, "_funding_seen_reasons", set())
+                            if reason and reason not in seen_reasons:
+                                seen_reasons.add(reason)
+                                self._funding_seen_reasons = seen_reasons
+                                logger.info("[资费诊断-ACCOUNT_UPDATE] m=%s B=%s P=%s | 完整: %s",
+                                           reason,
+                                           _json.dumps(balances, ensure_ascii=False)[:200],
+                                           _json.dumps(positions, ensure_ascii=False)[:200],
+                                           _json.dumps(data, ensure_ascii=False)[:400])
+
+                    elif e_type == "ORDER_TRADE_UPDATE":
+                        o = data.get("o", {})
+                        ws_lat = int(time.time() * 1000) - int(data.get("E", 0))
+                        logger.info("[用户数据WS] 订单推送: %s %s status=%s | 延迟 %dms",
+                                   o.get("s", ""), o.get("S", ""), o.get("X", ""), ws_lat)
+
+                    elif e_type == "listenKeyExpired":
+                        logger.warning("[用户数据WS] listenKey 过期，重连")
+                        break
+
+            except Exception as exc:
+                if "Connection" not in str(exc) and "closed" not in str(exc).lower():
+                    logger.warning("[用户数据WS] 读取异常: %s", exc)
+            # 断线重连
+            self._bn_user_data_ws = None
+            self._funding_ws_lost_at = time.time()
+            await asyncio.sleep(3)
+            try:
+                await self._ensure_bn_user_data_ws()
+                self._funding_ws_lost_at = 0.0
+                break
+            except Exception:
+                await asyncio.sleep(3)
+
+    async def _bn_user_data_ping(self) -> None:
+        """BN 用户数据 WS 心跳，每 50 秒 ping 一次防断线。"""
+        while True:
+            await asyncio.sleep(50)
+            ws = getattr(self, "_bn_user_data_ws", None)
+            if not ws or ws.closed:
+                break
+            try:
+                await ws.ping()
+            except Exception:
+                break
 
 
 
