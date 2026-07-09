@@ -329,7 +329,7 @@ class ExchangeRestMixin:
             "amount": amount,
             "filled": filled,
             "status": "closed" if ok else ("partial" if filled > 0 else "open"),
-            "transactTime": resp.get("transactTime", 0),
+            "transactTime": resp.get("transactTime", 0) or resp.get("updateTime", 0),
             "info": resp,
         }
 

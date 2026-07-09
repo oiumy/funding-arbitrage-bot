@@ -808,8 +808,13 @@ class TraderMixin:
             # WS 缓存验证
             ok, pos = self._ws_position_check("binance", symbol, "SHORT", expect_zero=False, amount=amount)
             if not ok:
-                await asyncio.sleep(0.05)
-                ok, pos = self._ws_position_check("binance", symbol, "SHORT", expect_zero=False, amount=amount)
+                # 轮询等 WS 持仓缓存刷新（ACCOUNT_UPDATE 在成交回报后 ~2ms 到），
+                # 确认即走，免固定睡 50ms；worst-case 仍 ~50ms 后走 REST 兜底
+                for _ in range(50):
+                    await asyncio.sleep(0.001)
+                    ok, pos = self._ws_position_check("binance", symbol, "SHORT", expect_zero=False, amount=amount)
+                    if ok:
+                        break
             if not ok:
                 pos = await self._cross_verify_binance_position(symbol, "SHORT")
                 ok = pos > 0
@@ -863,8 +868,13 @@ class TraderMixin:
                 logger.warning("合约开多WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
             ok, pos = self._ws_position_check("binance", symbol, "LONG", expect_zero=False, amount=amount)
             if not ok:
-                await asyncio.sleep(0.05)
-                ok, pos = self._ws_position_check("binance", symbol, "LONG", expect_zero=False, amount=amount)
+                # 轮询等 WS 持仓缓存刷新（ACCOUNT_UPDATE 在成交回报后 ~2ms 到），
+                # 确认即走，免固定睡 50ms；worst-case 仍 ~50ms 后走 REST 兜底
+                for _ in range(50):
+                    await asyncio.sleep(0.001)
+                    ok, pos = self._ws_position_check("binance", symbol, "LONG", expect_zero=False, amount=amount)
+                    if ok:
+                        break
             if not ok:
                 pos = await self._cross_verify_binance_position(symbol, "LONG")
                 ok = pos > 0

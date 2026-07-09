@@ -495,6 +495,9 @@ class WebSocketMixin:
 
                         if funding_detected:
                             recv_wall_ms = int(time.time() * 1000)
+                            # 资费金额直接从 bc 抓（USDT-M 结算币种为 USDT），最准，免 REST 竞态
+                            funding_amount = sum(
+                                float(b.get("bc", 0) or 0) for b in balances)
                             recv_time_str = time.strftime(
                                 "%H:%M:%S", time.localtime(recv_wall_ms / 1000))
                             recv_time_str += f".{recv_wall_ms % 1000:03d}"
@@ -507,6 +510,7 @@ class WebSocketMixin:
                                 snipe.last_funding_tx_ms = int(binance_tx_ms) if binance_tx_ms else 0
                                 snipe.last_funding_event_ms = int(data.get("E", 0))
                                 snipe.last_funding_recv_ms = recv_wall_ms
+                                snipe.last_funding_amount_usdt = funding_amount
                                 snipe.ws_funding_arrived_event.set()
                             if binance_tx_ms:
                                 bn_time_str = time.strftime(
@@ -534,6 +538,41 @@ class WebSocketMixin:
                         ws_lat = int(time.time() * 1000) - int(data.get("E", 0))
                         logger.info("[用户数据WS] 订单推送: %s %s status=%s | 延迟 %dms",
                                    o.get("s", ""), o.get("S", ""), o.get("X", ""), ws_lat)
+                        # 实时抓取成交回报(rp价格盈亏 + n手续费)，最准，免平仓后 REST userTrades 竞态。
+                        # 拥堵结算下 REST 可能只返回单腿，rp/手续费漏半 → 净利记错。WS 每笔成交都推。
+                        snipe = getattr(self, "_bn_snipe", None)
+                        if snipe is not None and o.get("x") == "TRADE":
+                            target = getattr(snipe, "_clean_symbol", "")
+                            if not target or o.get("s") == target:
+                                snipe.last_realized_pnl_usdt += float(o.get("rp", 0) or 0)
+                                comm = float(o.get("n", 0) or 0)
+                                if comm:
+                                    snipe.last_commission += comm
+                                    snipe.last_commission_asset = (
+                                        o.get("N", "") or snipe.last_commission_asset)
+                                snipe.last_fill_count += 1
+                                # 开仓腿(非 reduce)全部成交(X=FILLED)→ 记真实开仓均价(ap)，
+                                # 供止盈按真实成交价而非陈旧扫描价计算触发距。
+                                # 卡 FILLED 而非任一笔 TRADE：确保 ap 是完整成交的加权均价，
+                                # 而非中途某笔部分成交的均价。
+                                if not o.get("R") and o.get("X") == "FILLED":
+                                    ap = float(o.get("ap", 0) or 0)
+                                    if ap > 0:
+                                        snipe.last_open_avg_price = ap
+                                # 止盈成交标记：算法条件单触发生成的子市价单，clientOrderId(c)
+                                # 由交易所自动生成(不带我方 clientAlgoId)，但会带
+                                # ot(原始类型)=TAKE_PROFIT_MARKET 或 st(策略类型)=C_TAKE_PROFIT。
+                                # 普通市价平仓 ot=MARKET 不含 TAKE_PROFIT，不会误判。
+                                # → 供账本打标签 + 平仓时跳过白等资费。
+                                otype = (str(o.get("ot", "")) + "|"
+                                         + str(o.get("st", ""))).upper()
+                                if ("TAKE_PROFIT" in otype
+                                        or str(o.get("c", "")).startswith("TPSNIPE")):
+                                    snipe.tp_filled = True
+                                    # 机房侧被动止盈已成交、仓位已归零 → 提前拉响信号弹，
+                                    # 唤醒主循环 run_cycle 的 ws_funding_arrived_event.wait()，
+                                    # 免其空等到 400/600ms 硬死线（此时资费必不会到账）。
+                                    snipe.ws_funding_arrived_event.set()
 
                     elif e_type == "listenKeyExpired":
                         logger.warning("[用户数据WS] listenKey 过期，重连")
@@ -603,7 +642,7 @@ class WebSocketMixin:
                 {"id": rid, "method": "order.place", "params": params})
             result = await asyncio.wait_for(fut, timeout=15.0)
             t1 = time.perf_counter()
-            raw = result.get("result", {})
+            raw = result
             transact_time = raw.get("transactTime", 0) or raw.get("updateTime", 0)
             fill_ms = transact_time - t0_ms if transact_time > 0 else 0
             logger.info("[延迟] BN WS 下单 %s %s: 往返 %.0fms | 成交 %dms",
@@ -624,6 +663,77 @@ class WebSocketMixin:
         except Exception:
             self._bn_trade_futures.pop(rid, None)
             raise
+
+    async def _bn_trade_ws_stop_order(self, symbol: str, side: str,
+                                       stop_price: str | float, position_side: str,
+                                       client_id: str) -> bool:
+        """BN 止盈条件单 — TAKE_PROFIT_MARKET + closePosition，走持久 WS 的 algoOrder.place。
+        条件单不能走 order.place（-4120），须用 algo 端点，触发价字段为 triggerPrice。
+        无 quantity/reduceOnly：挂着时不占用仓位/保证金，仓位归零时交易所自动撤销，
+        故不会挤占后续收资费的市价全平。尽力而为：受理(有 algoId)即成功，
+        失败返回 False，绝不抛给交易主流程。"""
+        import uuid as _uuid
+        rid = None
+        try:
+            await self._ensure_bn_trade_ws()
+            clean = self._clean_futures_symbol(symbol)
+            ts = int(time.time() * 1000)
+            params: dict[str, Any] = {
+                "apiKey": BINANCE_API_KEY,
+                "algoType": "CONDITIONAL",
+                "symbol": clean,
+                "side": side.upper(),
+                "type": "TAKE_PROFIT_MARKET",
+                "triggerPrice": stop_price,
+                "closePosition": True,   # 原生 JSON 布尔：WS 是强类型 JSON 帧，官方定义 closePosition 为 boolean，
+                                         # 传字符串 "true" 可能在类型反序列化阶段被 -1102 拒（走不到验签）
+                "positionSide": position_side.upper(),
+                "workingType": "CONTRACT_PRICE",
+                "clientAlgoId": client_id,
+                "timestamp": ts,
+                "recvWindow": 5000,
+            }
+            # 签名须与服务器对 JSON 值的字符串化一致：布尔 True/False → 小写 "true"/"false"。
+            # 若用 str(True) 会得到大写 "True"，与 send_json 序列化出的小写 true 不符 → -1022 签名失效。
+            sorted_items = sorted(
+                (str(k), "true" if v is True else "false" if v is False else str(v))
+                for k, v in params.items()
+            )
+            qs = "&".join(f"{k}={v}" for k, v in sorted_items)
+            params["signature"] = self._binance_sign(qs)
+
+            rid = str(_uuid.uuid4())[:8]
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            self._bn_trade_futures[rid] = fut
+            await self._bn_trade_ws.send_json(
+                {"id": rid, "method": "algoOrder.place", "params": params})
+            raw = await asyncio.wait_for(fut, timeout=5.0)
+            aid = raw.get("algoId", 0) if isinstance(raw, dict) else 0
+            if aid:
+                logger.info("[狙击] 止盈挂单成功 %s %s @ %s (closePosition, algoId=%s)",
+                            symbol, side, stop_price, aid)
+                return True
+            logger.warning("[狙击] 止盈挂单无 algoId: %s", raw)
+            return False
+        except Exception as exc:
+            if rid is not None:
+                self._bn_trade_futures.pop(rid, None)
+            logger.warning("[狙击] 止盈挂单失败 %s: %s", symbol, exc)
+            return False
+
+    async def _bn_cancel_order(self, symbol: str, client_id: str) -> None:
+        """尽力撤单：按 clientAlgoId 撤掉一张算法条件单（开仓失败后清理残留止盈单）。
+        算法单须走 /fapi/v1/algoOrder（普通 /fapi/v1/order 不认），冷路径不计延迟；
+        失败只 warning，不抛。正常平仓时仓位归零 → 交易所自动撤销(EXPIRED)，无需调用此法。"""
+        try:
+            await self._binance_request(
+                BINANCE_FUTURES_API, "/fapi/v1/algoOrder",
+                {"clientAlgoId": client_id},
+                method="DELETE",
+            )
+            logger.info("[狙击] 已撤残留止盈单 %s %s", symbol, client_id)
+        except Exception as exc:
+            logger.warning("[狙击] 撤残留止盈单失败 %s %s: %s", symbol, client_id, exc)
 
     # ── Gate 交易 WS（futures.order_place 频道直连下单） ──
 
