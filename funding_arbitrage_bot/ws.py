@@ -551,26 +551,40 @@ class WebSocketMixin:
                                     snipe.last_commission_asset = (
                                         o.get("N", "") or snipe.last_commission_asset)
                                 snipe.last_fill_count += 1
-                                # 开仓腿(非 reduce)全部成交(X=FILLED)→ 记真实开仓均价(ap)，
+                                # 关仓腿(reduce-only)成交到达标记 → 供 close_position_fast
+                                # 轮询确认关仓 ORDER_TRADE_UPDATE 已收到后再记账，防大结算
+                                # 推送延迟(>1s)导致账本漏记 rp。
+                                if o.get("R"):
+                                    snipe._close_fill_arrived = True
+                                    if snipe._close_fill_time_ms == 0:
+                                        snipe._close_fill_time_ms = int(o.get("T", 0))
+                                # 开仓腿(非 reduce)只要发生成交(x=TRADE)→ 记加权均价(ap)，
                                 # 供止盈按真实成交价而非陈旧扫描价计算触发距。
-                                # 卡 FILLED 而非任一笔 TRADE：确保 ap 是完整成交的加权均价，
-                                # 而非中途某笔部分成交的均价。
-                                if not o.get("R") and o.get("X") == "FILLED":
+                                # 不在 FILLED 卡死：极端行情开仓单被拆多笔部分成交、最后一笔
+                                # FILLED >150ms 才到时止盈窗口已关闭 → 先用中途 ap 顶上。
+                                # ps: ap 在 PARTIALLY_FILLED 时已是累计加权均价，精度足够。
+                                if not o.get("R") and o.get("x") == "TRADE":
                                     ap = float(o.get("ap", 0) or 0)
                                     if ap > 0:
                                         snipe.last_open_avg_price = ap
+                                    if snipe._open_fill_time_ms == 0:
+                                        snipe._open_fill_time_ms = int(o.get("T", 0))
                                 # 止盈成交标记：算法条件单触发生成的子市价单，clientOrderId(c)
                                 # 由交易所自动生成(不带我方 clientAlgoId)，但会带
                                 # ot(原始类型)=TAKE_PROFIT_MARKET 或 st(策略类型)=C_TAKE_PROFIT。
                                 # 普通市价平仓 ot=MARKET 不含 TAKE_PROFIT，不会误判。
                                 # → 供账本打标签 + 平仓时跳过白等资费。
+                                # 必须卡 FILLED：PARTIALLY_FILLED 时仓位还有残余，此时
+                                # tp_filled=True 会赛跑唤醒主循环发出第二单市价全平，与止盈
+                                # 剩余成交撞车 → -2022/账本混乱。彻底 FILLED 后才算数。
                                 otype = (str(o.get("ot", "")) + "|"
                                          + str(o.get("st", ""))).upper()
                                 if ("TAKE_PROFIT" in otype
                                         or str(o.get("c", "")).startswith("TPSNIPE")):
-                                    snipe.tp_filled = True
-                                    # 机房侧被动止盈已成交、仓位已归零 → 提前拉响信号弹，
-                                    # 唤醒主循环 run_cycle 的 ws_funding_arrived_event.wait()，
+                                    if o.get("X") == "FILLED":
+                                        snipe.tp_filled = True
+                                        # 机房侧被动止盈已成交、仓位已归零 → 提前拉响信号弹，
+                                        # 唤醒主循环 run_cycle 的 ws_funding_arrived_event.wait()，
                                     # 免其空等到 400/600ms 硬死线（此时资费必不会到账）。
                                     snipe.ws_funding_arrived_event.set()
 

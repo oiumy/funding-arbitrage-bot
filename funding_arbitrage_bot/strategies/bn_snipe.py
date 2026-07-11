@@ -14,6 +14,14 @@ from ..constants import *
 from .. import constants as _c
 from ..models import LegResult, _safe_float
 
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, numbers
+    from openpyxl.utils import get_column_letter
+    _XLSX_AVAILABLE = True
+except ImportError:
+    _XLSX_AVAILABLE = False
+
 if TYPE_CHECKING:
     from ..bot import FundingArbitrageBot
 
@@ -54,6 +62,16 @@ class BnSnipeStrategy:
         self.tp_filled: bool = False                   # 本轮止盈单是否已成交，由 ws.py 写入（供账本打标签）
         self.last_open_avg_price: float = 0.0          # 开仓腿真实成交均价(WS ap)，由 ws.py 写入，供止盈按真实价算触发
         self._tp_task: asyncio.Task | None = None      # 止盈挂单的 fire-and-forget 任务句柄（持引用防 GC）
+        self._tp_client_id: str = ""                # 本轮止盈单 clientAlgoId，供平仓后主动撤单
+        self._close_fill_arrived: bool = False      # 关仓腿 ORDER_TRADE_UPDATE 已到达，由 ws.py 写入（供记账轮询）
+        # ── 全链路时间戳（绝对值，CSV 审计用） ──
+        self._open_send_time: float = 0.0           # 发出开仓订单 (time.time())
+        self._open_fill_time_ms: int = 0            # 开仓成交时刻 (ORDER_TRADE_UPDATE T)，由 ws.py 写入
+        self._open_ack_time: float = 0.0            # 收到开仓确认 (time.time())
+        self._tp_send_time: float = 0.0             # 发出止盈单 (time.time())
+        self._close_send_time: float = 0.0          # 发出平仓订单 (time.time())
+        self._close_fill_time_ms: int = 0           # 平仓成交时刻 (ORDER_TRADE_UPDATE T)，由 ws.py 写入
+        self._close_ack_time: float = 0.0           # 收到平仓确认 (time.time())
 
     # ── 扫描 ───────────────────────────────────────────────
 
@@ -163,9 +181,20 @@ class BnSnipeStrategy:
         self.last_fill_count = 0
         self.tp_filled = False
         self.last_open_avg_price = 0.0
+        self._tp_client_id = ""
+        self._tp_task = None
+        self._close_fill_arrived = False
+        self._open_send_time = 0.0
+        self._open_fill_time_ms = 0
+        self._open_ack_time = 0.0
+        self._tp_send_time = 0.0
+        self._close_send_time = 0.0
+        self._close_fill_time_ms = 0
+        self._close_ack_time = 0.0
         self._clean_symbol = self.bot._clean_futures_symbol(symbol)
 
         send_ts = time.time()
+        self._open_send_time = send_ts
         t0 = time.perf_counter()
         # 开仓作为后台任务跑（其内含 ~50ms 持仓校验 sleep）；不等它整条返回——
         # 一旦 WS 捕获到开仓真实成交均价(ap，约 :00.01 到)就立刻按真实价挂止盈，
@@ -202,12 +231,15 @@ class BnSnipeStrategy:
                 # fire-and-forget：止盈是尽力而为的旁挂，绝不能让它的回执卡在半路而
                 # 拖住关键的 开仓→等资费→平仓 路径（await 回执最坏会堵到 5s 超时）。
                 # 单子已在 send_json 那刻发出、由该协程自行 log 成败；主流程不等它。
+                self._tp_send_time = time.time()
                 self._tp_task = asyncio.create_task(
                     self.bot._bn_trade_ws_stop_order(
                         symbol, tp_side, stop_price, pos_side, cid))
                 tp_client_id = cid
+                self._tp_client_id = cid
 
         result = await open_task
+        self._open_ack_time = time.time()
         rtt_ms = (time.perf_counter() - t0) * 1000
         send_str = time.strftime("%H:%M:%S", time.localtime(send_ts))
         send_str += f".{int((send_ts % 1) * 1000):03d}"
@@ -247,35 +279,49 @@ class BnSnipeStrategy:
 
     async def close_position_fast(self) -> tuple[bool, float]:
         """极速平仓。先开枪后说话，重试间隔 2ms。返回 (成功, 纯净RTT_ms)。
-        ReduceOnly 拒绝 = 首次已成交，视为成功。"""
+        ReduceOnly 拒绝 = 首次已成交，视为成功。
+        止盈已满额成交时跳过发单，直接收尾。"""
         if not self.is_open:
             return True, 0.0
 
         sym, amt, d = self.symbol, self.amount, self.direction
         send_ts = time.time()
+        self._close_send_time = send_ts
         t0 = time.perf_counter()
-        for attempt in range(3):
-            if d == "short":
-                result = await self.bot._cross_close_short_leg("binance", sym, amt)
-            else:
-                result = await self.bot._cross_close_long_leg("binance", sym, amt)
-            if result.ok:
-                break
-            # ReduceOnly = 仓位已被首次平掉，视为成功
-            if result.error and "-2022" in str(result.error):
-                logger.info("[狙击] 平仓重试命中 ReduceOnly，首次已成交，视为成功")
-                result = LegResult(True, result.market_type, result.symbol, result.side, result.amount)
-                break
-            if attempt < 2:
-                logger.warning("[狙击] 平仓受阻！第 %d/3 次极速重试", attempt + 1)
-                await asyncio.sleep(0.002)
-        rtt_ms = (time.perf_counter() - t0) * 1000
+
+        # 止盈已在机房侧完全成交(closePosition=true, 仓位归零) → 跳过市价平仓，
+        # 不发任何冗余单，直接进入状态清理与账本落盘。cached result 保证下游不变。
+        if self.tp_filled:
+            logger.info("[狙击] 止盈已在机房侧完全成交，跳过市价平仓发单")
+            result: LegResult = LegResult(True, "futures", sym,
+                                          "BUY" if d == "short" else "SELL", amt)
+            rtt_ms = 0.0
+        else:
+            for attempt in range(3):
+                if d == "short":
+                    result = await self.bot._cross_close_short_leg("binance", sym, amt)
+                else:
+                    result = await self.bot._cross_close_long_leg("binance", sym, amt)
+                if result.ok:
+                    break
+                # ReduceOnly = 仓位已被首次平掉，视为成功
+                if result.error and "-2022" in str(result.error):
+                    logger.info("[狙击] 平仓重试命中 ReduceOnly，首次已成交，视为成功")
+                    result = LegResult(True, result.market_type, result.symbol, result.side, result.amount)
+                    break
+                if attempt < 2:
+                    logger.warning("[狙击] 平仓受阻！第 %d/3 次极速重试", attempt + 1)
+                    await asyncio.sleep(0.002)
+            rtt_ms = (time.perf_counter() - t0) * 1000
+
         send_str = time.strftime("%H:%M:%S", time.localtime(send_ts))
         send_str += f".{int((send_ts % 1) * 1000):03d}"
 
         if not result.ok:
             logger.critical("[狙击] 平仓失败！%s | 发送=%s", result.error, send_str)
             return False, rtt_ms
+
+        self._close_ack_time = time.time()
 
         # 只有确认平仓成功后才清状态，防止幽灵裸仓
         # 记录前先保存值
@@ -294,6 +340,18 @@ class BnSnipeStrategy:
         self.net_rate = 0.0
         self.futures_fee = 0.0
 
+        # 主动撤止盈单兜底：仓位已平。先 await tp_task 确认止盈单确已落地（内部自带5s上限、不抛），
+        # 再按 clientAlgoId 精撤——补上"平仓抢在止盈落地之前"的僵尸单缺口。
+        # 与币安 closePosition 自动撤单叠加：正常路径下自动撤单已撤 → 这刀撤到 unknown order，被 _bn_cancel_order 吞掉，幂等无害。
+        if self._tp_task is not None:
+            try:
+                await self._tp_task
+            except Exception:
+                pass
+            if self._tp_client_id:
+                await self.bot._bn_cancel_order(_sym, self._tp_client_id)
+            self._tp_task = None
+
         # 平仓后算完整利润：价格盈亏 + 资费 - 手续费
         buy_avg = sell_avg = _entry
         total_commission = 0.0
@@ -309,10 +367,24 @@ class BnSnipeStrategy:
                 logger.warning("[狙击] 资费 5s 未到账，按 REST 兜底记账 %s", _sym)
         await asyncio.sleep(0.5)
 
+        # 关仓 ORDER_TRADE_UPDATE 在大结算(00/08/16 UTC)可能延迟 >1s 推送
+        # （币安 E 字段滞后 T 字段 1.2s+）。轮询等到 _close_fill_arrived 确保
+        # rp 已完整捕获后再记账，超时 5s 走 REST 兜底。
+        # tp_filled 同理：止盈成交也会设 _close_fill_arrived（R=true），轮询即可。
+        if not self._close_fill_arrived:
+            for _ in range(50):
+                if self._close_fill_arrived:
+                    break
+                await asyncio.sleep(0.1)
+            if not self._close_fill_arrived:
+                logger.warning("[狙击] 关仓成交推送未到达，改用 REST 兜底记账 %s", _sym)
+
         # ── 价格盈亏 + 手续费：优先 WS 实时成交回报(rp/n)，免 REST userTrades 竞态 ──
         # 拥堵结算下 REST 可能只返回单腿成交，rp/手续费漏半(曾把 -0.36 价盈记成 -0.036)。
         # WS ORDER_TRADE_UPDATE 每笔成交都推 rp(交易所结算价盈)与 n(手续费)，最准。
-        if self.last_fill_count > 0:
+        # 必须等关仓成交推送已到（_close_fill_arrived）才能用 WS 数据，否则 rp 只有开仓腿(0)
+        # → 价格盈亏记成 0。
+        if self.last_fill_count > 0 and self._close_fill_arrived:
             price_pnl = self.last_realized_pnl_usdt
             total_commission = self.last_commission
             commission_asset = self.last_commission_asset
@@ -404,8 +476,18 @@ class BnSnipeStrategy:
         # ── 完整账本落盘（真实盈亏 + 三段延迟 + 成交质量）──
         if self.tp_filled:
             self._last_trigger_type = "TP_止盈"
+
+        # 方向感知的开仓价/平仓价/滑点
+        _entry_price = _entry
+        if _dir == "long":
+            _exit_price = _entry + price_pnl / _amt if _amt else _entry
+        else:
+            _exit_price = _entry - price_pnl / _amt if _amt else _entry
+        _slippage_pct = price_pnl / notional * 100 if notional else 0.0
+
         self._record_ledger(
             symbol=_sym, direction=_dir, funding_rate=_rate, notional=notional,
+            entry_price=_entry_price, exit_price=_exit_price, slippage_pct=_slippage_pct,
             funding_income=funding_income, price_pnl=price_pnl,
             fee_native=fee_native, fee_asset=fee_asset, bnb_price=bnb_price,
             fee_usdt=fee_usdt, net_pnl=profit, fill_count=trade_count,
@@ -433,13 +515,19 @@ class BnSnipeStrategy:
         return time.time() * 1000 >= (self.next_funding_time_ms + self.current_delay_ms)
 
     async def check_position(self) -> bool:
-        """WS 缓存验证裸仓是否存在。"""
+        """裸仓安全守卫：WS 缓存优先，抖动时走 REST 最终确认，绝不盲清状态。"""
         if not self.is_open:
             return False
         pos_side = "SHORT" if self.direction == "short" else "LONG"
         ok, _ = self.bot._ws_position_check("binance", self.symbol, pos_side, expect_zero=False, amount=self.amount)
         if not ok:
-            logger.warning("[狙击] 仓位丢失 %s %s", self.symbol, pos_side)
+            # WS 没查到不慌：高负载结算期 ACCOUNT_UPDATE 推送经常延迟数百 ms，
+            # 用 REST 做最终确认——裸仓策略绝不能把真实的 WS 延迟误判为"仓位不存在"。
+            pos = await self.bot._cross_verify_binance_position(self.symbol, pos_side)
+            if pos > 0:
+                logger.info("[狙击] WS持仓延迟，经 REST 确认仓位仍在 %.4f", pos)
+                return True
+            logger.warning("[狙击] 经 REST 最终确认仓位已不存在 %s %s", self.symbol, pos_side)
             self.is_open = False
             return False
         return True
@@ -464,55 +552,75 @@ class BnSnipeStrategy:
         timeline = " → ".join(f"{k}={v - base:+d}ms" for k, v in ts.items() if v > 0)
         logger.info("[全链路] %s", timeline)
 
+    _BJT = 8 * 3600  # UTC+8 偏移，强制北京时间
+
+    @staticmethod
+    def _fmt_ms(ms: int) -> str:
+        """毫秒时间戳 → 北京时间字符串，0 返回空。"""
+        if ms <= 0:
+            return ""
+        lt = time.gmtime(ms / 1000 + BnSnipeStrategy._BJT)
+        return time.strftime("%Y-%m-%d %H:%M:%S", lt) + f".{ms % 1000:03d}"
+
+    @staticmethod
+    def _fmt_ts(ts: float) -> str:
+        """time.time() 浮点秒 → 北京时间字符串，0 返回空。"""
+        if ts <= 0:
+            return ""
+        lt = time.gmtime(ts + BnSnipeStrategy._BJT)
+        return time.strftime("%Y-%m-%d %H:%M:%S", lt) + f".{int((ts % 1) * 1000):03d}"
+
     def _record_ledger(self, *, symbol: str, direction: str, funding_rate: float,
-                       notional: float, funding_income: float, price_pnl: float,
+                       notional: float, entry_price: float, exit_price: float,
+                       slippage_pct: float, funding_income: float, price_pnl: float,
                        fee_native: float, fee_asset: str, bnb_price: float,
                        fee_usdt: float, net_pnl: float, fill_count: int,
                        settle_fallback_ms: int) -> None:
-        """完整账本：一单一行写入 data/funding_ledger.csv。
-        含真实盈亏(资费/价格/手续费/净利) + 三段延迟 + 成交质量 + 触发方式。"""
+        """完整账本：一单一行写入 data/funding_ledger.csv。25 列中英双语。"""
         csv_path = Path("data/funding_ledger.csv")
         file_exists = csv_path.exists()
 
-        # 三段延迟（时间戳由 ws.py 在 FUNDING_FEE 到账时写入）
-        # max(0,…) 规避极端拥堵下 E<T 时钟语义倒挂产生的负数幽灵
-        a = self.last_funding_tx_ms      # 币安结算记账
-        b = self.last_funding_event_ms   # 币安 WS 推送
-        c = self.last_funding_recv_ms    # 本地收到
-        push_delay = max(0, b - a) if (a and b) else 0        # 结算→推送(币安内部)
-        network_delay = max(0, c - b) if (b and c) else 0     # 推送→收到(网络)
-        total_delay = max(0, c - a) if (a and c) else 0       # 结算→收到(端到端)
+        # 旧格式 → 新格式自动迁移：检测首列是否为旧版英文名，是则重命名备份
+        if file_exists:
+            try:
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                if first_line.startswith("record_time,"):
+                    backup = csv_path.with_name("funding_ledger_old.csv")
+                    csv_path.rename(backup)
+                    file_exists = False
+                    logger.info("[账本迁移] 旧格式 CSV 已备份为 %s，新建 25 列中英双语格式", backup)
+            except Exception:
+                pass
 
-        settle_ms = a or settle_fallback_ms
-        settle_time = ""
-        settle_hour = ""
-        if settle_ms:
-            lt = time.localtime(settle_ms / 1000)
-            settle_time = time.strftime("%Y-%m-%d %H:%M:%S", lt) + f".{settle_ms % 1000:03d}"
-            settle_hour = str(lt.tm_hour)
+        settle_ms = self.last_funding_tx_ms or settle_fallback_ms
 
         row = {
-            "record_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-            "symbol": symbol,
-            "direction": direction,
-            "funding_rate": f"{funding_rate:.6f}",
-            "notional_usdt": f"{notional:.4f}",
-            "settle_time": settle_time,
-            "settle_ts_ms": str(settle_ms),
-            "settle_hour": settle_hour,
-            "push_delay_ms": str(push_delay),
-            "network_delay_ms": str(network_delay),
-            "total_delay_ms": str(total_delay),
-            "funding_received_usdt": f"{funding_income:.6f}",
-            "realized_pnl_usdt": f"{price_pnl:.6f}",
-            "fee_native": f"{fee_native:.8f}",
-            "fee_asset": fee_asset,
-            "bnb_price": f"{bnb_price:.4f}",
-            "fee_usdt": f"{fee_usdt:.6f}",
-            "net_pnl_usdt": f"{net_pnl:.6f}",
-            "fill_count": str(fill_count),
-            "trigger_type": self._last_trigger_type,
-            "e2e_latency_ms": str(self._last_e2e_ms),
+            "记录时间(record_time)": self._fmt_ts(time.time()),
+            "交易对(symbol)": symbol,
+            "方向(direction)": direction,
+            "资金费率(funding_rate)": f"{funding_rate:.6f}",
+            "名义价值USDT(notional_usdt)": f"{notional:.4f}",
+            "开仓价(entry_price)": f"{entry_price:.6f}",
+            "发出开仓订单时间(open_send_time)": self._fmt_ts(self._open_send_time),
+            "开仓成交时间(open_fill_time)": self._fmt_ms(self._open_fill_time_ms),
+            "平仓价(exit_price)": f"{exit_price:.6f}",
+            "滑点%(slippage_pct)": f"{slippage_pct:.4f}",
+            "价格盈亏USDT(price_pnl)": f"{price_pnl:.6f}",
+            "资费收入USDT(funding_income)": f"{funding_income:.6f}",
+            "手续费_原生(fee_native)": f"{fee_native:.8f}",
+            "手续费_币种(fee_asset)": fee_asset,
+            "手续费USDT(fee_usdt)": f"{fee_usdt:.6f}",
+            "总收益USDT(net_pnl)": f"{net_pnl:.6f}",
+            "资费结算时间(funding_settle_time)": self._fmt_ms(settle_ms),
+            "收到资费推送时间(funding_recv_time)": self._fmt_ms(self.last_funding_recv_ms),
+            "发出止盈单时间(tp_send_time)": self._fmt_ts(self._tp_send_time),
+            "发出平仓订单时间(close_send_time)": self._fmt_ts(self._close_send_time),
+            "平仓成交时间(close_fill_time)": self._fmt_ms(self._close_fill_time_ms),
+            "收到开仓确认时间(open_ack_time)": self._fmt_ts(self._open_ack_time),
+            "收到平仓确认时间(close_ack_time)": self._fmt_ts(self._close_ack_time),
+            "触发方式(trigger_type)": self._last_trigger_type,
+            "成交笔数(fill_count)": str(fill_count),
         }
 
         # 记账绝不能影响交易主流程：写入独立包裹，失败只记 error
@@ -531,20 +639,68 @@ class BnSnipeStrategy:
             all_rows: list[dict] = []
             with open(csv_path, "r", encoding="utf-8") as f:
                 for r in csv.DictReader(f):
-                    if r.get("net_pnl_usdt"):  # 跳过断电/写入中断残留的空行
+                    if r.get("总收益USDT(net_pnl)"):  # 跳过断电/写入中断残留的空行
                         all_rows.append(r)
             total = len(all_rows)
             if total > 0:
-                wins = sum(1 for r in all_rows if float(r.get("net_pnl_usdt", 0) or 0) > 0)
+                wins = sum(1 for r in all_rows if float(r.get("总收益USDT(net_pnl)", 0) or 0) > 0)
                 win_rate = wins / total * 100
-                total_net = sum(float(r.get("net_pnl_usdt", 0) or 0) for r in all_rows)
-                ws_rows = [r for r in all_rows if r.get("trigger_type") == "WS_TRIGGER"]
+                total_net = sum(float(r.get("总收益USDT(net_pnl)", 0) or 0) for r in all_rows)
+                ws_rows = [r for r in all_rows if r.get("触发方式(trigger_type)") == "WS_TRIGGER"]
                 ws_rate = len(ws_rows) / total * 100
-                avg_lat = (sum(int(r.get("e2e_latency_ms", 0) or 0) for r in ws_rows) / len(ws_rows)) if ws_rows else 0.0
-                logger.info("[账本大盘] 📊 累计 %d 单 | 盈利 %d 单(%.1f%%) | 累计净利 %.4fU | WS抢跑 %d 单(%.1f%%) 均延迟 %.0fms",
-                            total, wins, win_rate, total_net, len(ws_rows), ws_rate, avg_lat)
+                logger.info("[账本大盘] 📊 累计 %d 单 | 盈利 %d 单(%.1f%%) | 累计净利 %.4fU | WS抢跑 %d 单(%.1f%%)",
+                            total, wins, win_rate, total_net, len(ws_rows), ws_rate)
+            # XLSX 导出：自动列宽 + 时间格式，打开即用
+            self._write_ledger_xlsx(all_rows, list(row.keys()))
         except Exception as e:
             logger.debug("[账本大盘统计跳过] 解析历史数据异常(可能有脏行): %s", e)
+
+    @staticmethod
+    def _write_ledger_xlsx(all_rows: list[dict], fieldnames: list[str]) -> None:
+        """从 CSV 行数据生成 XLSX：自适应列宽 + 时间列格式化为 yyyy-mm-dd hh:mm:ss.000。
+        与 CSV 并行写入，失败不影响交易。"""
+        if not _XLSX_AVAILABLE:
+            return
+        try:
+            xlsx_path = Path("data/funding_ledger.xlsx")
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "资费狙击账本"
+
+            # 写表头（加粗 + 居中对齐）
+            header_font = Font(bold=True)
+            header_align = Alignment(horizontal="center", vertical="center")
+            for ci, name in enumerate(fieldnames, 1):
+                cell = ws.cell(row=1, column=ci, value=name)
+                cell.font = header_font
+                cell.alignment = header_align
+
+            # 识别时间列（列名含"时间"或"time"）
+            time_cols = {ci for ci, n in enumerate(fieldnames, 1)
+                         if "时间" in n or "time" in n.lower()}
+
+            # 写数据行
+            for ri, row in enumerate(all_rows, 2):
+                for ci, name in enumerate(fieldnames, 1):
+                    val = row.get(name, "")
+                    cell = ws.cell(row=ri, column=ci, value=val)
+
+            # 自适应列宽：取表头长度和每列数据最长值的 max，上下限 8-40
+            for ci in range(1, len(fieldnames) + 1):
+                header_len = len(ws.cell(row=1, column=ci).value or "")
+                data_max = 0
+                for ri in range(2, len(all_rows) + 2):
+                    v = ws.cell(row=ri, column=ci).value
+                    if v:
+                        data_max = max(data_max, len(str(v)))
+                width = max(header_len * 1.3, data_max + 2)
+                width = max(8, min(width, 40))
+                ws.column_dimensions[get_column_letter(ci)].width = width
+
+            wb.save(str(xlsx_path))
+            logger.debug("[账本] XLSX 已更新 %d 行", len(all_rows))
+        except Exception as exc:
+            logger.debug("[账本] XLSX 写入失败: %s", exc)
 
     # ── 主循环 ─────────────────────────────────────────────
 
@@ -625,7 +781,7 @@ class BnSnipeStrategy:
                     interval_hours = int(chosen.get("interval_hours", DEFAULT_FUNDING_INTERVAL_HOURS))
 
                     # ── 死线兜底: WS 资费通知为主力，超时才走此兜底 ──
-                    self.current_delay_ms = 600.0 if rate_abs >= 0.015 else 400.0
+                    self.current_delay_ms = 400.0
 
                     logger.info("[狙击] 目标 %s | 节点 %02d:00 | 周期 %dh | 妖币=%s | 延时: %dms",
                                  str(chosen["symbol"]), settle_hour, interval_hours,
@@ -653,8 +809,10 @@ class BnSnipeStrategy:
                             pass
 
                     open_at_ms = snipe_ms - _c.BN_SNIPE_OPEN_OFFSET_MS
-                    logger.info("[狙击] 锁定 %s，T-%dms 准时开枪",
-                                 fast_args["symbol"], _c.BN_SNIPE_OPEN_OFFSET_MS)
+                    offset_ms = _c.BN_SNIPE_OPEN_OFFSET_MS
+                    tag = "结算前%dms" % offset_ms if offset_ms > 0 else ("结算后%dms" % abs(offset_ms) if offset_ms < 0 else "整点")
+                    logger.info("[狙击] 锁定 %s，开仓=%s（+%dms）",
+                                 fast_args["symbol"], tag, int(open_at_ms - snipe_ms))
                     await asyncio.sleep(max(0, (open_at_ms - time.time() * 1000) / 1000))
 
                     # 终极防线: 关闭 GC, 开仓→平仓这 1s 内绝不允许 GC 背刺
