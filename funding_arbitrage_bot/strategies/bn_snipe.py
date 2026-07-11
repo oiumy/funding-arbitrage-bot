@@ -95,6 +95,12 @@ class BnSnipeStrategy:
 
         futures_market_index = self.bot._build_futures_market_index()
 
+        # 字母排位：该 base 在全量 USDT 永续字母序中的百分位（0=最靠前，→1=最靠后）。
+        # 用于动态时点——字母越靠后，币安资费记账越晚（实测 Pearson≈0.77）。
+        all_bases = sorted(futures_market_index.keys())
+        n_bases = max(1, len(all_bases))
+        base_rank_pct = {b: i / n_bases for i, b in enumerate(all_bases)}
+
         # 记录 BNBUSDT 标记价，用于把 BNB 抵扣的手续费换算成 USDT
         bnb_market = futures_market_index.get("BNB")
         if bnb_market:
@@ -134,6 +140,7 @@ class BnSnipeStrategy:
             rows.append({
                 "symbol": symbol,
                 "base": base,
+                "rank_pct": base_rank_pct.get(base, 0.0),
                 "futures_price": _safe_float(ticker.get("last")),
                 "funding_rate": rate,
                 "abs_rate": abs_rate,
@@ -780,12 +787,23 @@ class BnSnipeStrategy:
                     settle_hour = time.localtime(nft_ms / 1000).tm_hour
                     interval_hours = int(chosen.get("interval_hours", DEFAULT_FUNDING_INTERVAL_HOURS))
 
-                    # ── 死线兜底: WS 资费通知为主力，超时才走此兜底 ──
-                    self.current_delay_ms = 400.0
+                    # ── 按字母排位线性设开仓/平仓时点（默认）或固定值 ──
+                    # rank% 越大(字母越靠后)→记账越晚→开仓延迟与平仓死线都线性增大。
+                    rank_pct = float(chosen.get("rank_pct", 0.0))
+                    if _c.BN_SNIPE_RANK_TIMING_ENABLED:
+                        p = min(1.0, max(0.0, rank_pct))
+                        open_offset_ms = -(_c.BN_SNIPE_OPEN_MS_MIN
+                                           + p * (_c.BN_SNIPE_OPEN_MS_MAX - _c.BN_SNIPE_OPEN_MS_MIN))
+                        self.current_delay_ms = (_c.BN_SNIPE_CLOSE_MS_MIN
+                                                 + p * (_c.BN_SNIPE_CLOSE_MS_MAX - _c.BN_SNIPE_CLOSE_MS_MIN))
+                    else:
+                        open_offset_ms = _c.BN_SNIPE_OPEN_OFFSET_MS
+                        self.current_delay_ms = 400.0
 
-                    logger.info("[狙击] 目标 %s | 节点 %02d:00 | 周期 %dh | 妖币=%s | 延时: %dms",
+                    logger.info("[狙击] 目标 %s | 节点 %02d:00 | 周期 %dh | 妖币=%s | 字母排位=%.0f%% | 开=结算后%.0fms 平死线=%.0fms",
                                  str(chosen["symbol"]), settle_hour, interval_hours,
-                                 "YES" if rate_abs >= 0.015 else "NO", int(self.current_delay_ms))
+                                 "YES" if rate_abs >= 0.015 else "NO",
+                                 rank_pct * 100, abs(open_offset_ms), self.current_delay_ms)
 
                     fast_args = {
                         "symbol": str(chosen["symbol"]),
@@ -808,9 +826,8 @@ class BnSnipeStrategy:
                         except Exception:
                             pass
 
-                    open_at_ms = snipe_ms - _c.BN_SNIPE_OPEN_OFFSET_MS
-                    offset_ms = _c.BN_SNIPE_OPEN_OFFSET_MS
-                    tag = "结算前%dms" % offset_ms if offset_ms > 0 else ("结算后%dms" % abs(offset_ms) if offset_ms < 0 else "整点")
+                    open_at_ms = snipe_ms - open_offset_ms
+                    tag = "结算前%dms" % open_offset_ms if open_offset_ms > 0 else ("结算后%dms" % abs(open_offset_ms) if open_offset_ms < 0 else "整点")
                     logger.info("[狙击] 锁定 %s，开仓=%s（+%dms）",
                                  fast_args["symbol"], tag, int(open_at_ms - snipe_ms))
                     await asyncio.sleep(max(0, (open_at_ms - time.time() * 1000) / 1000))
