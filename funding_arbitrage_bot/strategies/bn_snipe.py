@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import gc
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -64,6 +65,10 @@ class BnSnipeStrategy:
         self._tp_task: asyncio.Task | None = None      # 止盈挂单的 fire-and-forget 任务句柄（持引用防 GC）
         self._tp_client_id: str = ""                # 本轮止盈单 clientAlgoId，供平仓后主动撤单
         self._close_fill_arrived: bool = False      # 关仓腿 ORDER_TRADE_UPDATE 已到达，由 ws.py 写入（供记账轮询）
+        self._interval_hours: int = 0               # 本轮标的资费周期(1/4/8h)，扫描时写入，供账本
+        self._batch_size: int = 0                   # 本轮结算时刻全市场同批结算的币数（记账排队长度），供账本
+        self._subset_rank: int = -1                 # 本轮标的在同批(同结算时刻)字母序中的位次(0起)，供账本
+        self._settle_hour_utc: int = -1             # 本轮结算节点 UTC 整点(0-23)，供账本
         # ── 全链路时间戳（绝对值，CSV 审计用） ──
         self._open_send_time: float = 0.0           # 发出开仓订单 (time.time())
         self._open_fill_time_ms: int = 0            # 开仓成交时刻 (ORDER_TRADE_UPDATE T)，由 ws.py 写入
@@ -100,6 +105,19 @@ class BnSnipeStrategy:
         all_bases = sorted(futures_market_index.keys())
         n_bases = max(1, len(all_bases))
         base_rank_pct = {b: i / n_bases for i, b in enumerate(all_bases)}
+
+        # 批：全市场每个结算时刻(next_funding_time)有哪些币一起结算，按字母序排。
+        # 币安按批、且批内按字母序处理记账 → 批越大排队越长、批内越靠后记账越晚。
+        # batch_size=该批币数；subset_rank=本币在该批字母序中的位次(0起)——比全市场 rank_pct 更准。
+        nft_batch_members: dict[int, list[str]] = {}
+        for _base, _m in futures_market_index.items():
+            _nft = self.bot._extract_next_funding_time(funding_rates.get(_m["symbol"], {}))
+            if _nft:
+                nft_batch_members.setdefault(_nft, []).append(_base)
+        nft_batch_pos: dict[int, dict[str, int]] = {}
+        for _nft, _lst in nft_batch_members.items():
+            _lst.sort()
+            nft_batch_pos[_nft] = {b: i for i, b in enumerate(_lst)}
 
         # 记录 BNBUSDT 标记价，用于把 BNB 抵扣的手续费换算成 USDT
         bnb_market = futures_market_index.get("BNB")
@@ -153,6 +171,8 @@ class BnSnipeStrategy:
                 "remain_min": remain_s / 60,
                 "settle_local": settle_str,
                 "interval_hours": interval_hours,
+                "batch_size": len(nft_batch_members.get(next_ft, [])),
+                "subset_rank": nft_batch_pos.get(next_ft, {}).get(base, -1),
             })
 
         if not rows:
@@ -583,22 +603,11 @@ class BnSnipeStrategy:
                        fee_native: float, fee_asset: str, bnb_price: float,
                        fee_usdt: float, net_pnl: float, fill_count: int,
                        settle_fallback_ms: int) -> None:
-        """完整账本：一单一行写入 data/funding_ledger.csv。25 列中英双语。"""
+        """完整账本：一单一行写入 data/funding_ledger.csv。31 列中英双语（表头变更自动迁移）。"""
         csv_path = Path("data/funding_ledger.csv")
         file_exists = csv_path.exists()
 
-        # 旧格式 → 新格式自动迁移：检测首列是否为旧版英文名，是则重命名备份
-        if file_exists:
-            try:
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                if first_line.startswith("record_time,"):
-                    backup = csv_path.with_name("funding_ledger_old.csv")
-                    csv_path.rename(backup)
-                    file_exists = False
-                    logger.info("[账本迁移] 旧格式 CSV 已备份为 %s，新建 25 列中英双语格式", backup)
-            except Exception:
-                pass
+        # 旧→新格式迁移放在 row 构建之后进行（需按 row.keys() 比对表头），见下方写入前。
 
         settle_ms = self.last_funding_tx_ms or settle_fallback_ms
 
@@ -628,12 +637,43 @@ class BnSnipeStrategy:
             "收到平仓确认时间(close_ack_time)": self._fmt_ts(self._close_ack_time),
             "触发方式(trigger_type)": self._last_trigger_type,
             "成交笔数(fill_count)": str(fill_count),
+            "资费周期h(funding_interval_hours)": str(self._interval_hours),
+            "批大小(batch_size)": str(self._batch_size),
+            "批内位次(subset_rank)": str(self._subset_rank),
+            "结算UTC时(settle_hour_utc)": str(self._settle_hour_utc),
+            "平仓死线ms(close_deadline_ms)": f"{self.current_delay_ms:.0f}",
+            "是否收到资费(funding_collected)": "1" if abs(funding_income) > 1e-12 else "0",
         }
+
+        # 旧格式 → 新格式自动迁移：表头与当前列不完全一致(缺列/改名/加列)即备份重建，永久自适应。
+        # 用「复制备份」而非「改名」：先 copy 一份 bak（只读，不与 Excel 争独占锁），本次写入用 "w" 截断重写新表头。
+        # xlsx 备份单独 try：即使被 Excel 占用备份失败，也不拖累 CSV 迁移（xlsx 本就每次从 CSV 整体重建）。
+        migrated = False
+        if file_exists:
+            try:
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    first_line = f.readline().rstrip("\r\n")
+                if first_line and first_line != ",".join(row.keys()):
+                    suffix = time.strftime("%Y%m%d_%H%M%S")
+                    shutil.copy2(csv_path, csv_path.with_name(f"funding_ledger_bak_{suffix}.csv"))
+                    try:
+                        xlsx_prev = Path("data/funding_ledger.xlsx")
+                        if xlsx_prev.exists():
+                            shutil.copy2(xlsx_prev, xlsx_prev.with_name(f"funding_ledger_bak_{suffix}.xlsx"))
+                    except Exception as ex:
+                        logger.warning("[账本迁移] 旧 XLSX 备份失败(可能被 Excel 占用)，CSV 迁移继续: %s", ex)
+                    migrated = True
+                    file_exists = False
+                    logger.info("[账本迁移] 表头变更，旧账本已备份(后缀 %s)，重建为最新格式", suffix)
+            except Exception as ex:
+                logger.warning("[账本迁移] 迁移失败，保持原文件不动: %s", ex)
 
         # 记账绝不能影响交易主流程：写入独立包裹，失败只记 error
         try:
             csv_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            # 迁移轮用 "w" 截断旧内容重写新表头（旧数据已 copy 到 bak）；常规轮用 "a" 追加。
+            mode = "w" if migrated else "a"
+            with open(csv_path, mode, newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=list(row.keys()))
                 if not file_exists:
                     writer.writeheader()
@@ -786,6 +826,10 @@ class BnSnipeStrategy:
                     nft_ms = float(chosen["next_funding_time_ms"])
                     settle_hour = time.localtime(nft_ms / 1000).tm_hour
                     interval_hours = int(chosen.get("interval_hours", DEFAULT_FUNDING_INTERVAL_HOURS))
+                    self._interval_hours = interval_hours
+                    self._batch_size = int(chosen.get("batch_size", 0))
+                    self._subset_rank = int(chosen.get("subset_rank", -1))
+                    self._settle_hour_utc = time.gmtime(nft_ms / 1000).tm_hour
 
                     # ── 按字母排位线性设开仓/平仓时点（默认）或固定值 ──
                     # rank% 越大(字母越靠后)→记账越晚→开仓延迟与平仓死线都线性增大。
