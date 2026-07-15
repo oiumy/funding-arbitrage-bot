@@ -186,7 +186,6 @@ class ScannerMixin:
         bn_markets = getattr(self.futures, "markets", None)
         if not bn_markets:
             return index
-        tradfi_skipped = 0
         for market in bn_markets.values():
             is_usdt_swap = (
                 market.get("swap")
@@ -195,12 +194,7 @@ class ScannerMixin:
                 and market.get("active", True)
             )
             if is_usdt_swap:
-                if market.get("info", {}).get("underlyingType") == "STOCK":
-                    tradfi_skipped += 1
-                    continue
                 index[market["base"]] = market
-        if tradfi_skipped:
-            logger.debug("Binance 跳过 %d 个 TradFi 股票代币", tradfi_skipped)
         return index
 
 

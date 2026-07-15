@@ -75,6 +75,17 @@ class ExchangeRestMixin:
                 logger.error("Binance API 请求失败: %s %s — %s", method, path, exc)
             raise
 
+    async def _binance_public_get(self, path: str, base_url: str = BINANCE_FUTURES_API,
+                                  ) -> dict[str, Any]:
+        """向币安公开端点发 GET（不签名），返回 JSON。失败抛异常由调用方处理。"""
+        url = f"{base_url}{path}"
+        def _do() -> dict[str, Any]:
+            import json as _json, urllib.request as _ur  # noqa — 线程内安全
+            req = _ur.Request(url, headers={"User-Agent": "funding-arbitrage-bot/1.0"})
+            with _ur.urlopen(req, timeout=15) as resp:
+                return _json.loads(resp.read())  # type: ignore[no-any-return]
+        return await asyncio.to_thread(_do)
+
     async def _gate_request(
         self, path: str, body: dict | None = None, method: str = "GET",
         timeout: int = 15, params: dict | None = None,

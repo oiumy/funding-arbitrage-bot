@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import gc
+import math
 import shutil
 import time
 import uuid
@@ -69,6 +70,8 @@ class BnSnipeStrategy:
         self._batch_size: int = 0                   # 本轮结算时刻全市场同批结算的币数（记账排队长度），供账本
         self._subset_rank: int = -1                 # 本轮标的在同批(同结算时刻)字母序中的位次(0起)，供账本
         self._settle_hour_utc: int = -1             # 本轮结算节点 UTC 整点(0-23)，供账本
+        self._funding_intervals: dict[str, int] = {}  # 资费周期缓存(原生符号→小时)，1h 刷新
+        self._funding_intervals_at: float = 0.0
         # ── 全链路时间戳（绝对值，CSV 审计用） ──
         self._open_send_time: float = 0.0           # 发出开仓订单 (time.time())
         self._open_fill_time_ms: int = 0            # 开仓成交时刻 (ORDER_TRADE_UPDATE T)，由 ws.py 写入
@@ -97,6 +100,26 @@ class BnSnipeStrategy:
         )
         _spot_fees, futures_taker_fees = fee_pair
         default_futures_fee = futures_taker_fees.get("__default__", DEFAULT_FUTURES_TAKER_FEE)
+
+        # 资费周期：exchangeInfo 不含 fundingIntervalHours，需查 fundingInfo（公开接口，不用签名）。
+        # 缓存1h：狙击扫描在 T-10s、总预算12s，这里若慢请求会挤占开仓窗口，短超时+缓存兜底。
+        if not self._funding_intervals or time.time() - self._funding_intervals_at > 3600:
+            try:
+                fi_data = await asyncio.wait_for(
+                    self.bot._binance_public_get("/fapi/v1/fundingInfo"), timeout=3,
+                )
+                intervals: dict[str, int] = {}
+                for fi in fi_data:
+                    sym = fi.get("symbol", "")
+                    interval = fi.get("fundingIntervalHours")
+                    if sym and interval is not None:
+                        intervals[sym] = int(interval)
+                if intervals:
+                    self._funding_intervals = intervals
+                    self._funding_intervals_at = time.time()
+            except Exception:
+                pass  # 失败沿用旧缓存/默认8h，不阻塞扫描
+        funding_intervals = self._funding_intervals
 
         futures_market_index = self.bot._build_futures_market_index()
 
@@ -153,7 +176,8 @@ class BnSnipeStrategy:
             remain_s = (next_ft - time.time() * 1000) / 1000 if (next_ft is not None and next_ft > 0) else 0
             settle_str = time.strftime("%H:%M", time.localtime(next_ft / 1000)) if (next_ft is not None and next_ft > 0) else "?"
 
-            interval_hours = int(market["info"].get("fundingIntervalHours", DEFAULT_FUNDING_INTERVAL_HOURS))
+            # fundingInfo 返回原生符号(BTCUSDT)，用 market["id"] 查，别用统一格式 symbol
+            interval_hours = funding_intervals.get(market.get("id", ""), DEFAULT_FUNDING_INTERVAL_HOURS)
 
             rows.append({
                 "symbol": symbol,
@@ -173,6 +197,7 @@ class BnSnipeStrategy:
                 "interval_hours": interval_hours,
                 "batch_size": len(nft_batch_members.get(next_ft, [])),
                 "subset_rank": nft_batch_pos.get(next_ft, {}).get(base, -1),
+                "contract_type": market.get("info", {}).get("contractType", ""),
             })
 
         if not rows:
@@ -811,7 +836,7 @@ class BnSnipeStrategy:
                             chosen_amount = amount
                             logger.info("[狙击] 目标 #%d %s: 费率=%.4f%% 方向=%s 张数=%.4f",
                                          idx + 1, sym, float(candidate["funding_rate"]) * 100,
-                                         str(candidate["direction"]), amount)
+                                         str(candidate["direction"]), chosen_amount)
                             break
                         logger.warning("[狙击] #%d %s 数量=%.4f，尝试下一位", idx + 1, sym, amount)
 
@@ -833,11 +858,17 @@ class BnSnipeStrategy:
 
                     # ── 按字母排位线性设开仓/平仓时点（默认）或固定值 ──
                     # rank% 越大(字母越靠后)→记账越晚→开仓延迟与平仓死线都线性增大。
+                    # TradFi 股票合约例外：T实测~107ms，早于普通币，需更早开仓。
+                    contract_type = str(chosen.get("contract_type", ""))
+                    is_tradfi = contract_type.startswith("TRAD")  # 币安实际返回 TRADIFI_PERPETUAL（官方拼写多个I），前缀匹配兜住两种拼法
                     rank_pct = float(chosen.get("rank_pct", 0.0))
+                    p = min(1.0, max(0.0, rank_pct))
                     if _c.BN_SNIPE_RANK_TIMING_ENABLED:
-                        p = min(1.0, max(0.0, rank_pct))
-                        open_offset_ms = -(_c.BN_SNIPE_OPEN_MS_MIN
-                                           + p * (_c.BN_SNIPE_OPEN_MS_MAX - _c.BN_SNIPE_OPEN_MS_MIN))
+                        if is_tradfi:
+                            open_offset_ms = -_c.BN_SNIPE_TRADFI_OPEN_MS
+                        else:
+                            open_offset_ms = -(_c.BN_SNIPE_OPEN_MS_MIN
+                                               + p * (_c.BN_SNIPE_OPEN_MS_MAX - _c.BN_SNIPE_OPEN_MS_MIN))
                         self.current_delay_ms = (_c.BN_SNIPE_CLOSE_MS_MIN
                                                  + p * (_c.BN_SNIPE_CLOSE_MS_MAX - _c.BN_SNIPE_CLOSE_MS_MIN))
                     else:
