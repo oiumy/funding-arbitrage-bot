@@ -252,10 +252,10 @@ class BnSnipeStrategy:
         # 一旦 WS 捕获到开仓真实成交均价(ap，约 :00.01 到)就立刻按真实价挂止盈，
         # 把持仓校验的 ~50ms 与挂止盈并行掉：止盈约 :00.03 就能挂上（≈旧并发的速度，但用真实价算触发）。
         if direction == "short":
-            open_coro = self.bot._cross_open_short_leg("binance", symbol, amount)
+            open_coro = self.bot._cross_open_short_leg("binance", symbol, amount, skip_position_check=True)
             pos_side = "SHORT"
         else:
-            open_coro = self.bot._cross_open_long_leg("binance", symbol, amount)
+            open_coro = self.bot._cross_open_long_leg("binance", symbol, amount, skip_position_check=True)
             pos_side = "LONG"
         open_task = asyncio.create_task(open_coro)
 
@@ -376,8 +376,10 @@ class BnSnipeStrategy:
         self._close_ack_time = time.time()
 
         # 只有确认平仓成功后才清状态，防止幽灵裸仓
-        # 记录前先保存值
+        # 记录前先保存值。此时 WS 已收到开仓真实均价 ap，用它覆写 _entry 得精确名义价值
         _sym, _amt, _entry, _dir = sym, amt, self.entry_price, d
+        if self.last_open_avg_price > 0:
+            _entry = self.last_open_avg_price
         _fee = self.futures_fee
         _nft = self.next_funding_time_ms
         _rate = self.funding_rate

@@ -795,8 +795,9 @@ class TraderMixin:
 
 
 
-    async def _cross_open_short_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """在指定交易所做空合约。WS 缓存验证，无 REST 网络往返。"""
+    async def _cross_open_short_leg(self, exchange: str, symbol: str, amount: float,
+                                     skip_position_check: bool = False) -> LegResult:
+        """在指定交易所做空合约。狙击模式 skip_position_check=True 时不验仓，直接进入平仓等待。"""
         position_side = "SHORT"
         if exchange == "binance":
             order, ws_error = None, None
@@ -804,7 +805,11 @@ class TraderMixin:
                 order = await self._bn_trade_ws_order(symbol, "sell", amount, position_side="SHORT")
             except Exception as exc:
                 ws_error = str(exc)
-                logger.warning("合约开空WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+                logger.warning("合约开空WS异常 %s: %s", symbol, exc)
+            if skip_position_check:
+                if ws_error:
+                    return LegResult(False, "futures", symbol, "sell", amount, error=ws_error)
+                return LegResult(True, "futures", symbol, "sell", amount, order=order)
             # WS 缓存验证
             ok, pos = self._ws_position_check("binance", symbol, "SHORT", expect_zero=False, amount=amount)
             if not ok:
@@ -857,8 +862,9 @@ class TraderMixin:
 
 
 
-    async def _cross_open_long_leg(self, exchange: str, symbol: str, amount: float) -> LegResult:
-        """在指定交易所做多合约。WS 缓存验证，无 REST 网络往返。"""
+    async def _cross_open_long_leg(self, exchange: str, symbol: str, amount: float,
+                                    skip_position_check: bool = False) -> LegResult:
+        """在指定交易所做多合约。狙击模式 skip_position_check=True 时不验仓，直接进入平仓等待。"""
         if exchange == "binance":
             order, ws_error = None, None
             try:
@@ -866,6 +872,10 @@ class TraderMixin:
             except Exception as exc:
                 ws_error = str(exc)
                 logger.warning("合约开多WS异常 %s: %s，以WS缓存验证为准", symbol, exc)
+            if skip_position_check:
+                if ws_error:
+                    return LegResult(False, "futures", symbol, "buy", amount, error=ws_error)
+                return LegResult(True, "futures", symbol, "buy", amount, order=order)
             ok, pos = self._ws_position_check("binance", symbol, "LONG", expect_zero=False, amount=amount)
             if not ok:
                 # 轮询等 WS 持仓缓存刷新（ACCOUNT_UPDATE 在成交回报后 ~2ms 到），
